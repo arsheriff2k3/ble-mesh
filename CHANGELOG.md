@@ -35,3 +35,15 @@ verified on radio hardware — the simulator has no Bluetooth (see
 - The example harness can hold direct conversations: a thread selector for
   `#general` and each peer, per-thread history and unread badges, and
   per-message delivery state.
+- Phase 2 durable chat: `FileMessageStore`, an append-only checksummed log
+  that keeps the outbound queue, conversations, message state, and seen packet
+  ids across process restarts. Exposed from `package:ble_mesh/file_store.dart`
+  rather than the main library so the core stays free of `dart:io`.
+- `MessageStore` gained message, state, and seen-id persistence alongside the
+  outbound queue, plus `open`/`close`. `InMemoryMessageStore` implements the
+  same contract and stays the default.
+- Queue quotas with an explicit `MessageStoreFullException` instead of silent
+  eviction, packet expiry enforced on read and on reopen, and log compaction
+  through an atomic rename.
+- Queued sends retry on a capped exponential backoff, and draining a backlog
+  is spaced by `retrySpacing` so a reconnect is not a broadcast burst.

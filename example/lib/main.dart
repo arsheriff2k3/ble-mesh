@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:ble_mesh/ble_mesh.dart';
+import 'package:ble_mesh/file_store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 void main() => runApp(const MeshChatHarness());
 
@@ -29,10 +32,10 @@ class ChatPage extends StatefulWidget {
 const _generalChannel = 'general';
 
 class _ChatPageState extends State<ChatPage> {
-  late final ChatIdentity _identity;
-  late final BleMeshTransport _ble;
-  late final BleChatTransport _chatTransport;
-  late final BleMeshChat _chat;
+  ChatIdentity? _identity;
+  BleMeshTransport? _ble;
+  BleChatTransport? _chatTransport;
+  BleMeshChat? _chat;
   final _text = TextEditingController();
   final _subscriptions = <StreamSubscription<void>>[];
   final _messages = <ChatMessage>[];
@@ -52,19 +55,63 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void initState() {
     super.initState();
+    unawaited(_bootstrap());
+  }
+
+  /// Loads the durable identity and store before wiring anything up.
+  ///
+  /// The identity has to outlive the process: a fresh peer id on every launch
+  /// would make a restart look like a different phone, and every restored
+  /// conversation would point at a peer nobody recognises.
+  Future<void> _bootstrap() async {
+    final directory = await getApplicationSupportDirectory();
+    final identity = await _loadIdentity(File('${directory.path}/identity'));
+    final chat = BleMeshChat(
+      store: FileMessageStore.at('${directory.path}/chat.log'),
+      // Space out a backlog so a reconnect after a long offline stretch does
+      // not hit neighbours with everything at once.
+      retrySpacing: const Duration(milliseconds: 120),
+    );
+    final ble = BleMeshTransport();
+    final chatTransport = BleChatTransport(identity: identity, transport: ble);
+    if (!mounted) return;
+    setState(() {
+      _identity = identity;
+      _ble = ble;
+      _chat = chat;
+      _chatTransport = chatTransport;
+    });
+    _listen(chat, chatTransport, ble);
+    _append('identity ${identity.peerId}');
+    unawaited(_refreshAdapter());
+  }
+
+  Future<ChatIdentity> _loadIdentity(File file) async {
+    if (file.existsSync()) {
+      final saved = (await file.readAsString()).trim();
+      if (saved.isNotEmpty) {
+        return ChatIdentity(
+          peerId: saved,
+          displayName: 'Phone ${saved.split('-').last}',
+        );
+      }
+    }
     final suffix = Random.secure()
         .nextInt(0xffffff)
         .toRadixString(16)
         .padLeft(6, '0');
-    _identity = ChatIdentity(
-      peerId: 'peer-$suffix',
-      displayName: 'Phone $suffix',
-    );
-    _ble = BleMeshTransport();
-    _chatTransport = BleChatTransport(identity: _identity, transport: _ble);
-    _chat = BleMeshChat();
+    await file.parent.create(recursive: true);
+    await file.writeAsString('peer-$suffix', flush: true);
+    return ChatIdentity(peerId: 'peer-$suffix', displayName: 'Phone $suffix');
+  }
+
+  void _listen(
+    BleMeshChat chat,
+    BleChatTransport chatTransport,
+    BleMeshTransport ble,
+  ) {
     _subscriptions.addAll([
-      _chat.messages.listen((message) {
+      chat.messages.listen((message) {
         if (!mounted) return;
         setState(() {
           _messages.add(message);
@@ -74,48 +121,52 @@ class _ChatPageState extends State<ChatPage> {
           }
         });
       }),
-      _chat.peers.listen((peers) {
+      chat.peers.listen((peers) {
         if (!mounted) return;
         setState(() => _peers = peers);
       }),
-      _chat.messageStates.listen((state) {
+      chat.messageStates.listen((state) {
         if (mounted) {
           setState(() => _states[state.messageId] = state.state);
         }
         _append('${state.messageId.substring(0, 8)}: ${state.state.name}');
       }),
-      _chat.errors.listen((error) => _append('chat error: $error')),
-      _chatTransport.errors.listen(
-        (error) => _append('BLE chat error: $error'),
-      ),
-      _ble.adapterState.listen((state) {
+      chat.errors.listen((error) => _append('chat error: $error')),
+      chatTransport.errors.listen((error) => _append('BLE chat error: $error')),
+      ble.adapterState.listen((state) {
         if (!mounted) return;
         setState(() => _adapter = state);
       }),
-      _ble.linksChanged.listen((links) {
+      ble.linksChanged.listen((links) {
         if (!mounted) return;
         setState(() => _links = links);
       }),
     ]);
-    unawaited(_refreshAdapter());
   }
 
   Future<void> _refreshAdapter() async {
-    final adapter = await _ble.currentAdapterState();
-    if (mounted) setState(() => _adapter = adapter);
+    final adapter = await _ble?.currentAdapterState();
+    if (mounted && adapter != null) setState(() => _adapter = adapter);
   }
 
   Future<void> _start() async {
+    final ble = _ble;
+    final chat = _chat;
+    final identity = _identity;
+    final transport = _chatTransport;
+    if (ble == null || chat == null || identity == null || transport == null) {
+      return;
+    }
     try {
-      final permission = await _ble.requestPermissions();
+      final permission = await ble.requestPermissions();
       if (permission != BlePermissionState.granted &&
           permission != BlePermissionState.notRequired) {
         _append('Bluetooth permission: ${permission.name}');
         return;
       }
-      await _chat.initialize(identity: _identity, transports: [_chatTransport]);
+      await chat.initialize(identity: identity, transports: [transport]);
       if (mounted) setState(() => _running = true);
-      _append('mesh chat started as ${_identity.peerId}');
+      _append('mesh chat started as ${identity.peerId}');
     } on PlatformException catch (error) {
       _append('start failed: ${error.code} ${error.message ?? ''}');
     } on Object catch (error) {
@@ -162,12 +213,14 @@ class _ChatPageState extends State<ChatPage> {
     final value = _text.text.trim();
     if (value.isEmpty) return;
     _text.clear();
+    final chat = _chat;
+    if (chat == null) return;
     final peerId = _selectedPeerId;
     try {
       if (peerId == null) {
-        await _chat.send(conversationId: _generalChannel, text: value);
+        await chat.send(conversationId: _generalChannel, text: value);
       } else {
-        await _chat.sendDirect(peerId: peerId, text: value);
+        await chat.sendDirect(peerId: peerId, text: value);
       }
     } on Object catch (error) {
       _append('send failed: $error');
@@ -193,145 +246,151 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _disposeTransports() async {
-    await _chat.dispose();
-    await _ble.dispose();
+    await _chat?.dispose();
+    await _ble?.dispose();
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('ble_mesh chat harness')),
-    body: Column(
-      children: [
-        Material(
-          color: Theme.of(context).colorScheme.surfaceContainer,
-          child: ListTile(
-            title: Text(_identity.displayName),
-            subtitle: Text(
-              'adapter=${_adapter.name} · links=${_links.length} · '
-              'peers=${_peers.length}',
-            ),
-            trailing: FilledButton(
-              onPressed: _running ? null : _start,
-              child: Text(_running ? 'Running' : 'Start'),
+  Widget build(BuildContext context) {
+    final identity = _identity;
+    if (identity == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    return Scaffold(
+      appBar: AppBar(title: const Text('ble_mesh chat harness')),
+      body: Column(
+        children: [
+          Material(
+            color: Theme.of(context).colorScheme.surfaceContainer,
+            child: ListTile(
+              title: Text(identity.displayName),
+              subtitle: Text(
+                'adapter=${_adapter.name} · links=${_links.length} · '
+                'peers=${_peers.length}',
+              ),
+              trailing: FilledButton(
+                onPressed: _running ? null : _start,
+                child: Text(_running ? 'Running' : 'Start'),
+              ),
             ),
           ),
-        ),
-        SizedBox(
-          height: 52,
-          child: ListView(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            children: [
-              for (final thread in _threads)
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Center(
-                    child: Badge.count(
-                      count: _unread[thread] ?? 0,
-                      isLabelVisible: (_unread[thread] ?? 0) > 0,
-                      child: ChoiceChip(
-                        selected: thread == _thread,
-                        onSelected: (_) => _selectThread(thread),
-                        avatar: thread == _generalChannel
-                            ? const Icon(Icons.tag, size: 18)
-                            : Icon(
-                                _isConnected(thread)
-                                    ? Icons.smartphone
-                                    : Icons.signal_cellular_off,
-                                size: 18,
-                              ),
-                        label: Text(_labelFor(thread)),
-                      ),
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        ),
-        Expanded(
-          child: ListView.builder(
-            padding: const EdgeInsets.all(12),
-            itemCount: _visibleMessages.length,
-            itemBuilder: (context, index) {
-              final message = _visibleMessages[index];
-              final state = _states[message.id];
-              return Align(
-                alignment: message.isLocal
-                    ? Alignment.centerRight
-                    : Alignment.centerLeft,
-                child: Card(
-                  color: message.isLocal
-                      ? Theme.of(context).colorScheme.primaryContainer
-                      : null,
-                  child: Padding(
-                    padding: const EdgeInsets.all(10),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          state == null
-                              ? message.senderId
-                              : '${message.senderId} · ${state.name}',
-                          style: Theme.of(context).textTheme.labelSmall,
+          SizedBox(
+            height: 52,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              children: [
+                for (final thread in _threads)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Center(
+                      child: Badge.count(
+                        count: _unread[thread] ?? 0,
+                        isLabelVisible: (_unread[thread] ?? 0) > 0,
+                        child: ChoiceChip(
+                          selected: thread == _thread,
+                          onSelected: (_) => _selectThread(thread),
+                          avatar: thread == _generalChannel
+                              ? const Icon(Icons.tag, size: 18)
+                              : Icon(
+                                  _isConnected(thread)
+                                      ? Icons.smartphone
+                                      : Icons.signal_cellular_off,
+                                  size: 18,
+                                ),
+                          label: Text(_labelFor(thread)),
                         ),
-                        Text(message.text),
-                      ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.all(12),
+              itemCount: _visibleMessages.length,
+              itemBuilder: (context, index) {
+                final message = _visibleMessages[index];
+                final state = _states[message.id];
+                return Align(
+                  alignment: message.isLocal
+                      ? Alignment.centerRight
+                      : Alignment.centerLeft,
+                  child: Card(
+                    color: message.isLocal
+                        ? Theme.of(context).colorScheme.primaryContainer
+                        : null,
+                    child: Padding(
+                      padding: const EdgeInsets.all(10),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            state == null
+                                ? message.senderId
+                                : '${message.senderId} · ${state.name}',
+                            style: Theme.of(context).textTheme.labelSmall,
+                          ),
+                          Text(message.text),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _text,
+                    enabled: _running,
+                    onSubmitted: (_) => _send(),
+                    decoration: InputDecoration(
+                      border: const OutlineInputBorder(),
+                      hintText: _selectedPeerId == null
+                          ? 'Message #$_generalChannel'
+                          : 'Direct message ${_labelFor(_thread)}',
+                      helperText: _selectedPeerId == null
+                          ? null
+                          : 'Direct messages are not encrypted yet (Phase 3)',
                     ),
                   ),
                 ),
-              );
-            },
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _text,
-                  enabled: _running,
-                  onSubmitted: (_) => _send(),
-                  decoration: InputDecoration(
-                    border: const OutlineInputBorder(),
-                    hintText: _selectedPeerId == null
-                        ? 'Message #$_generalChannel'
-                        : 'Direct message ${_labelFor(_thread)}',
-                    helperText: _selectedPeerId == null
-                        ? null
-                        : 'Direct messages are not encrypted yet (Phase 3)',
-                  ),
+                IconButton.filled(
+                  onPressed: _running ? _send : null,
+                  icon: const Icon(Icons.send),
                 ),
-              ),
-              IconButton.filled(
-                onPressed: _running ? _send : null,
-                icon: const Icon(Icons.send),
+              ],
+            ),
+          ),
+          ExpansionTile(
+            title: const Text('Diagnostics'),
+            children: [
+              SizedBox(
+                height: 120,
+                child: ListView(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  children: [
+                    for (final entry in _log)
+                      Text(
+                        entry,
+                        style: const TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 11,
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ],
           ),
-        ),
-        ExpansionTile(
-          title: const Text('Diagnostics'),
-          children: [
-            SizedBox(
-              height: 120,
-              child: ListView(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                children: [
-                  for (final entry in _log)
-                    Text(
-                      entry,
-                      style: const TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 11,
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ],
-    ),
-  );
+        ],
+      ),
+    );
+  }
 }
