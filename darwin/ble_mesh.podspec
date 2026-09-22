@@ -12,7 +12,7 @@ layer exposes links, frames, and frame sizes only; the mesh protocol lives in Da
                        DESC
   s.homepage         = 'https://github.com/blemesh/ble_mesh'
   s.license          = { :type => 'MIT', :file => '../LICENSE' }
-  s.author           = { 'Mako IT Lab' => 'arsheriff2k3@gmail.com' }
+  s.author           = { 'Ryan Sheriff' => 'arsheriff2k3@gmail.com' }
   s.source           = { :path => '.' }
   s.source_files     = 'ble_mesh/Sources/ble_mesh/**/*.swift'
 

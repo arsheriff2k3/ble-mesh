@@ -2,8 +2,10 @@
 
 ## 0.1.0 (unreleased)
 
-First cut of the transport. Not yet verified on hardware; the Darwin sources
-have not been compiled (see `../README.md`).
+First cut of the transport. Android, iOS, and macOS build and link, and the
+example harness runs on an iOS simulator with the plugin registered. Not yet
+verified on radio hardware — the simulator has no Bluetooth (see
+`../README.md`).
 
 - Pigeon channel contract with a single ordered event channel, so a frame can
   never be delivered before the `linkUp` for its own link.

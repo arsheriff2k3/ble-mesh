@@ -183,6 +183,22 @@ cd example && flutter run                      # two devices, or it proves nothi
 `pigeons/ble_api.dart` is the single source of truth for the channel. Never edit
 `lib/src/ble_api.g.dart`, `BleApi.g.kt`, or `BleApi.g.swift` by hand.
 
+### Type-checking the Swift
+
+```bash
+tool/typecheck_darwin.sh
+```
+
+Type-checks every Swift source against the real `Flutter`/`FlutterMacOS`
+modules for all three Darwin targets — macOS, iOS device, iOS simulator — at the
+podspec's deployment targets. Targets whose SDK is missing are reported as
+skipped rather than silently passing, so it still does useful work on a machine
+with only the Command Line Tools (macOS only) or without the iOS platform
+bundle installed.
+
+It does **not** link, run `pod lib lint`, or touch a radio. It is a fast
+pre-flight, not a substitute for `flutter build`.
+
 One gotcha for future contract changes: Pigeon emits Swift enum cases verbatim,
 so an enum value named `internal` (or any other Swift keyword) generates code
 that does not compile. `BleErrorCode.internalError` is named the way it is for
@@ -219,9 +235,12 @@ iOS and macOS share one Swift source tree via `sharedDarwinSource: true`.
 
 ## Status
 
-Transport code for Android, iOS, and macOS is written and the Dart side is unit
-tested, but **nothing here has moved a byte over a real radio yet**. See
-`../README.md` for what is and is not verified before you depend on it.
+Android, iOS, and macOS all build and link; the harness runs on an iOS
+simulator with the plugin registered and answering; the Dart side is unit
+tested. But **nothing here has moved a byte over a real radio yet** — and the
+iOS simulator has no Bluetooth radio, so it cannot test the mesh at all. See
+`../README.md` for exactly what is and is not verified, including known Swift 6
+concurrency warnings, before you depend on it.
 
 ## License
 

@@ -35,15 +35,15 @@ public class BleMeshPlugin: NSObject, FlutterPlugin, BleMeshHostApi {
 
   // ---------------------------------------------------------------- host API
 
-  public func capabilities() throws -> BleCapabilities {
+  func capabilities() throws -> BleCapabilities {
     controller.capabilities()
   }
 
-  public func adapterState() throws -> BleAdapterState {
+  func adapterState() throws -> BleAdapterState {
     controller.adapterState()
   }
 
-  public func requestPermissions() async throws -> BlePermissionState {
+  func requestPermissions() async throws -> BlePermissionState {
     await withCheckedContinuation { continuation in
       DispatchQueue.main.async {
         self.controller.requestPermissions { state in
@@ -53,15 +53,15 @@ public class BleMeshPlugin: NSObject, FlutterPlugin, BleMeshHostApi {
     }
   }
 
-  public func start(config: BleConfig) async throws {
+  func start(config: BleConfig) async throws {
     try await onMain { try self.controller.start(config: config) }
   }
 
-  public func stop() async throws {
+  func stop() async throws {
     try await onMain { self.controller.stop() }
   }
 
-  public func send(linkId: String, frame: FlutterStandardTypedData) async throws {
+  func send(linkId: String, frame: FlutterStandardTypedData) async throws {
     try await withCheckedThrowingContinuation {
       (continuation: CheckedContinuation<Void, Error>) in
       DispatchQueue.main.async {
@@ -84,11 +84,11 @@ public class BleMeshPlugin: NSObject, FlutterPlugin, BleMeshHostApi {
     }
   }
 
-  public func disconnect(linkId: String) async throws {
+  func disconnect(linkId: String) async throws {
     try await onMain { self.controller.disconnect(linkId: linkId) }
   }
 
-  public func links() throws -> [BleLink] {
+  func links() throws -> [BleLink] {
     controller.links()
   }
 
