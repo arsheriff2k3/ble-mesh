@@ -1,0 +1,40 @@
+name: ble_mesh
+description: >-
+  Dual-role (central + peripheral) Bluetooth Low Energy byte transport for
+  building offline mesh networks. The native layer is a dumb byte pipe: links,
+  frames, and frame sizes only. Protocol, routing, and crypto live in Dart.
+version: 0.1.0
+publish_to: none
+topics:
+  - bluetooth
+  - ble
+  - mesh
+  - networking
+  - offline
+
+environment:
+  sdk: ^3.13.0
+  flutter: '>=3.32.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+  pigeon: ^29.0.2
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: dev.blemesh.ble_mesh
+        pluginClass: BleMeshPlugin
+      ios:
+        pluginClass: BleMeshPlugin
+        sharedDarwinSource: true
+      macos:
+        pluginClass: BleMeshPlugin
+        sharedDarwinSource: true
