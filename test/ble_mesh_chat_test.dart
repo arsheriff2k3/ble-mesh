@@ -37,14 +37,26 @@ void main() {
     );
 
     final received = <ChatMessage>[];
+    final sent = <ChatMessage>[];
+    final relayed = <ChatMessage>[];
     final states = <MessageState>[];
     c.messages.listen(received.add);
+    a.messages.listen(sent.add);
+    b.messages.listen(relayed.add);
     a.messageStates.listen((change) => states.add(change.state));
 
     await a.sendDirect(peerId: 'c', text: 'through B');
     await pumpEventQueue(times: 20);
 
     expect(received.map((message) => message.text), ['through B']);
+    // The relay moves the packet without it becoming a conversation.
+    expect(relayed, isEmpty);
+    // Both ends must agree on one thread key, so a UI can group the
+    // conversation. conversationId cannot do this: it is 'c' on both sides.
+    expect(received.single.threadId, 'a');
+    expect(sent.single.threadId, 'c');
+    expect(received.single.isDirect, isTrue);
+    expect(sent.single.isDirect, isTrue);
     expect(
       states,
       containsAllInOrder([MessageState.sending, MessageState.sent]),

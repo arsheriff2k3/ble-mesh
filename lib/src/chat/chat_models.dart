@@ -73,6 +73,8 @@ class ChatMessage {
   const ChatMessage({
     required this.id,
     required this.conversationId,
+    required this.threadId,
+    required this.isDirect,
     required this.senderId,
     required this.text,
     required this.createdAt,
@@ -80,7 +82,23 @@ class ChatMessage {
   });
 
   final String id;
+
+  /// The packet destination with its `c:`/`p:` prefix removed.
+  ///
+  /// For a channel this is the channel name, but for a direct message it is
+  /// the *recipient*, which is the local peer on the receiving side. Group by
+  /// [threadId] instead: `conversationId` does not identify both halves of a
+  /// direct conversation.
   final String conversationId;
+
+  /// Stable conversation key: the channel name, or for a direct message the
+  /// remote participant regardless of direction.
+  final String threadId;
+
+  /// Whether this message was addressed to a single peer rather than a
+  /// channel.
+  final bool isDirect;
+
   final String senderId;
   final String text;
   final DateTime createdAt;

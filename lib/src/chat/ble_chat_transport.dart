@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/services.dart';
+
 import '../ble_api.g.dart';
 import '../ble_mesh_transport.dart';
 import '../models.dart';
@@ -126,7 +128,10 @@ class BleChatTransport implements ChatTransport {
         }
         delivered++;
       } catch (error) {
-        _errors.add(error);
+        // A link that vanished mid-send is ordinary mesh behaviour, not a
+        // fault worth showing: the route simply does not count as delivered
+        // and the router queues or retries on what is left.
+        if (!_isVanishedLink(error)) _errors.add(error);
       }
     }
     return ChatTransportSendResult(
@@ -134,6 +139,14 @@ class BleChatTransport implements ChatTransport {
       deliveredRoutes: delivered,
     );
   }
+
+  /// Whether [error] means the link disappeared before the frame went out.
+  ///
+  /// The Dart-side link cache and the platform registry drop a link at
+  /// slightly different moments, so either layer can be the one to notice.
+  static bool _isVanishedLink(Object error) =>
+      error is BleUnknownLinkException ||
+      (error is PlatformException && error.code == 'unknown_link');
 
   Future<void> _sendAnnouncement(String linkId) async {
     final now = DateTime.now();

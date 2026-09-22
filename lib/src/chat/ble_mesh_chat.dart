@@ -114,6 +114,9 @@ class BleMeshChat {
     final message = ChatMessage(
       id: packet.id,
       conversationId: destination.substring(2),
+      // We are the sender, so the remote participant is the destination.
+      threadId: destination.substring(2),
+      isDirect: destination.startsWith('p:'),
       senderId: identity.peerId,
       text: text,
       createdAt: now,
@@ -181,6 +184,12 @@ class BleMeshChat {
           ChatMessage(
             id: packet.id,
             conversationId: packet.destination.substring(2),
+            // A direct packet is addressed to us, so the remote participant
+            // is the sender rather than the destination.
+            threadId: directForUs
+                ? packet.senderId
+                : packet.destination.substring(2),
+            isDirect: directForUs,
             senderId: packet.senderId,
             text: utf8.decode(packet.payload),
             createdAt: packet.createdAt,

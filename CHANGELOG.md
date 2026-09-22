@@ -26,3 +26,12 @@ verified on radio hardware — the simulator has no Bluetooth (see
   API.
 - Three-node in-memory relay coverage and a physical-device chat/diagnostics
   harness. Encryption is not part of this preview.
+- `ChatMessage.threadId` and `ChatMessage.isDirect`. `conversationId` is the
+  raw packet destination, which names the recipient and so differs between the
+  two ends of a direct conversation; `threadId` is the stable key to group by.
+- A link that disappears between the send decision and the platform write no
+  longer reaches `BleChatTransport.errors`. It was already reported through
+  `deliveredRoutes`, and the router queues or retries on the remaining links.
+- The example harness can hold direct conversations: a thread selector for
+  `#general` and each peer, per-thread history and unread badges, and
+  per-message delivery state.
