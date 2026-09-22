@@ -19,3 +19,10 @@ verified on radio hardware — the simulator has no Bluetooth (see
 - Dart facade with live link bookkeeping, `minFrameSize`, broadcast fan-out
   that reports per-link outcomes, typed exceptions, and graceful degradation on
   platforms with no BLE implementation.
+- Phase 1 chat preview: deterministic bounded packet codec, BLE fragmentation
+  and reassembly, peer announcements with duplicate-link suppression, TTL
+  flooding, deduplication, randomized relay jitter, direct-message
+  acknowledgements, in-memory offline queue, and the high-level `BleMeshChat`
+  API.
+- Three-node in-memory relay coverage and a physical-device chat/diagnostics
+  harness. Encryption is not part of this preview.

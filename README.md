@@ -1,5 +1,14 @@
 # ble_mesh
 
+Flutter plugin for transport-agnostic, offline-first mesh chat. The current
+`0.1.0` preview provides the dual-role BLE byte transport plus a Dart chat
+layer with packet routing, fragmentation, deduplication, acknowledgements, and
+an in-memory retry queue. Durable storage, encryption, and Nostr come later.
+
+See the [chat plugin implementation plan](docs/CHAT_PLUGIN_PLAN.md) for the
+target API, architecture, delivery phases, and physical-device acceptance
+criteria.
+
 Dual-role (central **and** peripheral) Bluetooth Low Energy byte transport for
 Flutter — the missing layer under a BLE mesh.
 
@@ -10,14 +19,13 @@ both at once, which is why this plugin exists: `flutter_blue_plus` and
 cannot carry data both ways. Without the dual role there is no mesh, only a
 star.
 
-Bring your own protocol. This package moves bytes between phones that have no
-internet, no cell network, and no infrastructure; what those bytes mean — chat
-messages, sensor readings, signed reports — is yours to decide.
+Use the included Phase 1 chat protocol, or build your own protocol directly on
+the byte transport for telemetry, signed reports, or other offline data.
 
 Android, iOS, and macOS. Web, Windows, and Linux degrade to a documented no-op
 rather than crashing.
 
-## Scope: a dumb byte pipe
+## Native scope: a dumb byte pipe
 
 The native layer knows about four things:
 
@@ -44,6 +52,31 @@ dependencies:
 ```
 
 ## Usage
+
+### Phase 1 chat API
+
+```dart
+final identity = ChatIdentity(peerId: 'device-a', displayName: 'Alice');
+final chat = BleMeshChat();
+
+await chat.initialize(
+  identity: identity,
+  transports: [BleChatTransport(identity: identity)],
+);
+
+chat.messages.listen((message) => print('${message.senderId}: ${message.text}'));
+chat.messageStates.listen((change) => print(change.state.name));
+
+await chat.send(conversationId: 'general', text: 'Hello mesh!');
+await chat.sendDirect(peerId: 'device-b', text: 'Private delivery');
+```
+
+The Phase 1 protocol provides bounded binary packets, fragmentation, controlled
+TTL flooding, duplicate suppression, acknowledgements, and an in-memory retry
+queue. It is **not encrypted yet**. Do not use it for sensitive messages;
+reviewed identity and encryption are Phase 3.
+
+### Low-level byte transport
 
 ```dart
 final transport = BleMeshTransport();
@@ -152,24 +185,29 @@ That last row is a product constraint, not a bug: a cluster needs at least one
 foregrounded device. Your UI must say so rather than implying a mesh that is
 not there.
 
-## Building a mesh on top
+## Chat protocol implementation
 
-The transport gives you links and frames. A working mesh chat also needs, in
-roughly this order:
+The transport gives you links and frames. The Phase 1 Dart chat layer now adds:
 
-1. **A packet codec** — a binary header with version, type, TTL, sender, and
-   length. Treat the parser as hostile input; it eats bytes from strangers.
-2. **Flood routing** with TTL decay, a dedupe cache keyed on
-   `(sender, timestamp, payload hash)`, and jittered rebroadcast. Without the
-   dedupe the mesh melts into a broadcast storm.
+1. **A packet codec** — a bounded binary header with version, type, packet ID,
+   TTL, sender, destination, timestamps, and payload length.
+2. **Flood routing** with TTL decay, a dedupe cache keyed on the random 128-bit
+   packet ID, and jittered rebroadcast. Without dedupe the mesh melts into a
+   broadcast storm.
 3. **Fragmentation** to `minFrameSize`, with reassembly timeouts and a size cap.
 4. **Duplicate-link suppression** — two devices usually connect to each other
    twice. Once announces have identified the peers, the lower peer ID keeps its
    outbound link and the higher one drops its own.
-5. **Identity and crypto** — signing keys, and a session handshake if messages
-   are private. Do not invent a protocol here; use published test vectors.
+5. **Peer announcements and acknowledgements** — enough to collapse duplicate
+   links and distinguish `sent` from destination-confirmed `delivered`.
 
-None of that belongs in native code, and none of it needs a radio to test.
+Identity authentication and payload encryption intentionally remain Phase 3.
+They must use a reviewed protocol with published test vectors.
+
+These layers are part of the high-level `ble_mesh` Flutter plugin API, not
+application-specific code. The existing byte API remains available for
+advanced consumers. See the
+[chat plugin implementation plan](docs/CHAT_PLUGIN_PLAN.md).
 
 ## Development
 
@@ -177,7 +215,7 @@ None of that belongs in native code, and none of it needs a radio to test.
 dart run pigeon --input pigeons/ble_api.dart   # after changing the contract
 flutter analyze
 flutter test
-cd example && flutter run                      # two devices, or it proves nothing
+cd example && flutter run                      # three devices prove mesh relay
 ```
 
 `pigeons/ble_api.dart` is the single source of truth for the channel. Never edit
@@ -239,8 +277,8 @@ Android, iOS, and macOS all build and link; the harness runs on an iOS
 simulator with the plugin registered and answering; the Dart side is unit
 tested. But **nothing here has moved a byte over a real radio yet** — and the
 iOS simulator has no Bluetooth radio, so it cannot test the mesh at all. See
-`../README.md` for exactly what is and is not verified, including known Swift 6
-concurrency warnings, before you depend on it.
+the implementation plan for the physical-device gates that must pass before
+you depend on it.
 
 ## License
 

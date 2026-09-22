@@ -8,6 +8,27 @@
 /// once instead of once per platform.
 library;
 
+export 'src/chat/ble_chat_transport.dart' show BleChatTransport;
+export 'src/chat/ble_mesh_chat.dart' show BleMeshChat;
+export 'src/chat/chat_models.dart'
+    show
+        ChatIdentity,
+        ChatMessage,
+        ChatPacket,
+        ChatPacketType,
+        ChatPeer,
+        MessageState,
+        MessageStateChange,
+        createPacketId,
+        packetIdToHex;
+export 'src/chat/chat_transport.dart'
+    show ChatTransport, ChatTransportSendResult, ReceivedChatPacket;
+export 'src/chat/fragmentation.dart'
+    show FragmentFormatException, PacketFragmenter, PacketReassembler;
+export 'src/chat/message_store.dart'
+    show DedupeCache, InMemoryMessageStore, MessageStore;
+export 'src/chat/packet_codec.dart'
+    show ChatPacketCodec, ChatPacketFormatException;
 export 'src/ble_api.g.dart'
     show
         BleAdapterState,

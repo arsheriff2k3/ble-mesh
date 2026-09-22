@@ -1,8 +1,8 @@
 name: ble_mesh
 description: >-
-  Dual-role (central + peripheral) Bluetooth Low Energy byte transport for
-  building offline mesh networks. The native layer is a dumb byte pipe: links,
-  frames, and frame sizes only. Protocol, routing, and crypto live in Dart.
+  Flutter plugin providing a dual-role Bluetooth Low Energy transport for
+  offline mesh chat. The native layer moves links and frames; routing, queues,
+  protocol, and crypto are implemented in shared Dart.
 version: 0.1.0
 publish_to: none
 topics:

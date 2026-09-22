@@ -1,301 +1,249 @@
 import 'dart:async';
-import 'dart:convert';
+import 'dart:math';
 
+import 'package:ble_mesh/ble_mesh.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:ble_mesh/ble_mesh.dart';
 
-/// Transport-level debugging harness.
-///
-/// Deliberately independent of any host app: when a link misbehaves on
-/// real hardware you want the smallest possible thing between you and the
-/// radio. Install on two devices, tap Start on both, and watch the link list.
-void main() => runApp(const HarnessApp());
+void main() => runApp(const MeshChatHarness());
 
-class HarnessApp extends StatelessWidget {
-  const HarnessApp({super.key});
+class MeshChatHarness extends StatelessWidget {
+  const MeshChatHarness({super.key});
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'ble_mesh harness',
-    theme: ThemeData(
-      colorSchemeSeed: const Color(0xFF00695C),
-      useMaterial3: true,
-    ),
-    home: const HarnessPage(),
+    title: 'ble_mesh chat harness',
+    theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
+    home: const ChatPage(),
   );
 }
 
-class LogEntry {
-  LogEntry(this.at, this.kind, this.message);
-
-  final DateTime at;
-  final String kind;
-  final String message;
-}
-
-class HarnessPage extends StatefulWidget {
-  const HarnessPage({super.key});
+class ChatPage extends StatefulWidget {
+  const ChatPage({super.key});
 
   @override
-  State<HarnessPage> createState() => _HarnessPageState();
+  State<ChatPage> createState() => _ChatPageState();
 }
 
-class _HarnessPageState extends State<HarnessPage> {
-  final _transport = BleMeshTransport();
+class _ChatPageState extends State<ChatPage> {
+  late final ChatIdentity _identity;
+  late final BleMeshTransport _ble;
+  late final BleChatTransport _chatTransport;
+  late final BleMeshChat _chat;
+  final _text = TextEditingController();
   final _subscriptions = <StreamSubscription<void>>[];
-  final _log = <LogEntry>[];
-
-  BleCapabilities? _capabilities;
-  BleAdapterState _adapterState = BleAdapterState.unknown;
-  BlePermissionState? _permission;
+  final _messages = <ChatMessage>[];
+  final _log = <String>[];
+  List<ChatPeer> _peers = const [];
   List<BleLink> _links = const [];
-
-  /// Echoes every inbound frame back on the same link, so a second device can
-  /// measure a real round trip rather than just "something arrived".
-  bool _echo = true;
-  var _counter = 0;
+  BleAdapterState _adapter = BleAdapterState.unknown;
+  bool _running = false;
 
   @override
   void initState() {
     super.initState();
+    final suffix = Random.secure()
+        .nextInt(0xffffff)
+        .toRadixString(16)
+        .padLeft(6, '0');
+    _identity = ChatIdentity(
+      peerId: 'peer-$suffix',
+      displayName: 'Phone $suffix',
+    );
+    _ble = BleMeshTransport();
+    _chatTransport = BleChatTransport(identity: _identity, transport: _ble);
+    _chat = BleMeshChat();
     _subscriptions.addAll([
-      _transport.adapterState.listen((state) {
-        setState(() => _adapterState = state);
-        _append('adapter', state.name);
+      _chat.messages.listen((message) {
+        if (!mounted) return;
+        setState(() => _messages.add(message));
       }),
-      _transport.linkUp.listen((link) {
-        _append(
-          'link up',
-          '${link.linkId} role=${link.role.name} '
-              'maxFrame=${link.maxFrameSize}B rssi=${link.rssi ?? '?'}',
-        );
+      _chat.peers.listen((peers) {
+        if (!mounted) return;
+        setState(() => _peers = peers);
       }),
-      _transport.linkDown.listen((down) {
-        _append('link down', '${down.linkId}: ${down.reason ?? 'no reason'}');
+      _chat.messageStates.listen(
+        (state) =>
+            _append('${state.messageId.substring(0, 8)}: ${state.state.name}'),
+      ),
+      _chat.errors.listen((error) => _append('chat error: $error')),
+      _chatTransport.errors.listen(
+        (error) => _append('BLE chat error: $error'),
+      ),
+      _ble.adapterState.listen((state) {
+        if (!mounted) return;
+        setState(() => _adapter = state);
       }),
-      _transport.linksChanged.listen((links) => setState(() => _links = links)),
-      _transport.errors.listen((error) => _append('error', error.toString())),
-      _transport.frames.listen(_onFrame),
+      _ble.linksChanged.listen((links) {
+        if (!mounted) return;
+        setState(() => _links = links);
+      }),
     ]);
-    _refreshStatus();
+    unawaited(_refreshAdapter());
+  }
+
+  Future<void> _refreshAdapter() async {
+    final adapter = await _ble.currentAdapterState();
+    if (mounted) setState(() => _adapter = adapter);
+  }
+
+  Future<void> _start() async {
+    try {
+      final permission = await _ble.requestPermissions();
+      if (permission != BlePermissionState.granted &&
+          permission != BlePermissionState.notRequired) {
+        _append('Bluetooth permission: ${permission.name}');
+        return;
+      }
+      await _chat.initialize(identity: _identity, transports: [_chatTransport]);
+      if (mounted) setState(() => _running = true);
+      _append('mesh chat started as ${_identity.peerId}');
+    } on PlatformException catch (error) {
+      _append('start failed: ${error.code} ${error.message ?? ''}');
+    } on Object catch (error) {
+      _append('start failed: $error');
+    }
+  }
+
+  Future<void> _send() async {
+    final value = _text.text.trim();
+    if (value.isEmpty) return;
+    _text.clear();
+    await _chat.send(conversationId: 'general', text: value);
+  }
+
+  void _append(String value) {
+    if (!mounted) return;
+    setState(() {
+      _log.insert(0, value);
+      if (_log.length > 100) _log.removeLast();
+    });
   }
 
   @override
   void dispose() {
     for (final subscription in _subscriptions) {
-      subscription.cancel();
+      unawaited(subscription.cancel());
     }
-    _transport.dispose();
+    _text.dispose();
+    unawaited(_disposeTransports());
     super.dispose();
   }
 
-  Future<void> _refreshStatus() async {
-    final capabilities = await _transport.capabilities();
-    final state = await _transport.currentAdapterState();
-    if (!mounted) return;
-    setState(() {
-      _capabilities = capabilities;
-      _adapterState = state;
-    });
-  }
-
-  void _onFrame(BleFrame frame) {
-    final text = _describe(frame.data);
-    _append('frame in', '${frame.linkId} ${frame.data.length}B $text');
-    if (!_echo) return;
-    final reply = Uint8List.fromList(utf8.encode('echo:$text'));
-    _transport
-        .send(frame.linkId, reply)
-        .then((_) => _append('echo out', '${frame.linkId} ${reply.length}B'))
-        .catchError((Object error) => _append('echo failed', '$error'));
-  }
-
-  String _describe(Uint8List data) {
-    try {
-      return utf8.decode(data);
-    } on FormatException {
-      return data.take(16).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-    }
-  }
-
-  void _append(String kind, String message) {
-    if (!mounted) return;
-    setState(() {
-      _log.insert(0, LogEntry(DateTime.now(), kind, message));
-      if (_log.length > 300) _log.removeLast();
-    });
-  }
-
-  Future<void> _requestPermissions() async {
-    final state = await _transport.requestPermissions();
-    if (!mounted) return;
-    setState(() => _permission = state);
-    _append('permission', state.name);
-    await _refreshStatus();
-  }
-
-  Future<void> _start() async {
-    try {
-      await _transport.start(
-        // Sample UUIDs are fine here. A real app generates its own — see
-        // `BleMeshUuids`.
-        config: BleMeshTransport.defaultConfig(advertisedName: 'bm-harness'),
-      );
-      _append('transport', 'started');
-    } on BleUnsupportedPlatformException catch (error) {
-      _append('transport', error.message);
-    } on PlatformException catch (error) {
-      _append('transport', 'start failed: ${error.code} ${error.message}');
-    }
-    if (mounted) setState(() {});
-  }
-
-  Future<void> _stop() async {
-    await _transport.stop();
-    _append('transport', 'stopped');
-    if (mounted) setState(() {});
-  }
-
-  Future<void> _broadcastPing() async {
-    final payload = Uint8List.fromList(utf8.encode('ping-${_counter++}'));
-    final report = await _transport.broadcast(payload);
-    _append(
-      'broadcast',
-      '${report.delivered.length} delivered, ${report.failed.length} failed'
-          '${report.failed.isEmpty ? '' : ' ${report.failed}'}',
-    );
-  }
-
-  Future<void> _pingLink(BleLink link) async {
-    final payload = Uint8List.fromList(utf8.encode('ping-${_counter++}'));
-    try {
-      final started = DateTime.now();
-      await _transport.send(link.linkId, payload);
-      final elapsed = DateTime.now().difference(started).inMilliseconds;
-      _append('sent', '${link.linkId} ${payload.length}B in ${elapsed}ms');
-    } catch (error) {
-      _append('send failed', '${link.linkId}: $error');
-    }
+  Future<void> _disposeTransports() async {
+    await _chat.dispose();
+    await _ble.dispose();
   }
 
   @override
-  Widget build(BuildContext context) {
-    final capabilities = _capabilities;
-    return Scaffold(
-      appBar: AppBar(title: const Text('ble_mesh harness')),
-      body: ListView(
-        padding: const EdgeInsets.all(12),
-        children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'adapter: ${_adapterState.name}',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                  if (capabilities != null)
-                    Text(
-                      'platform: ${capabilities.platformName} · '
-                      'central: ${capabilities.supportsCentral} · '
-                      'peripheral: ${capabilities.supportsPeripheral}',
-                    ),
-                  if (capabilities != null && !capabilities.supportsPeripheral)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 6),
-                      child: Text(
-                        'This device cannot advertise: it can receive from the '
-                        'mesh but peers cannot discover it.',
-                        style: TextStyle(fontWeight: FontWeight.w600),
-                      ),
-                    ),
-                  if (_permission != null) Text('permission: ${_permission!.name}'),
-                  Text('running: ${_transport.isRunning}'),
-                  Text('minFrameSize: ${_transport.minFrameSize ?? '-'}'),
-                ],
-              ),
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('ble_mesh chat harness')),
+    body: Column(
+      children: [
+        Material(
+          color: Theme.of(context).colorScheme.surfaceContainer,
+          child: ListTile(
+            title: Text(_identity.displayName),
+            subtitle: Text(
+              'adapter=${_adapter.name} · links=${_links.length} · '
+              'peers=${_peers.length}',
+            ),
+            trailing: FilledButton(
+              onPressed: _running ? null : _start,
+              child: Text(_running ? 'Running' : 'Start'),
             ),
           ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
+        ),
+        if (_peers.isNotEmpty)
+          SizedBox(
+            height: 44,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              children: [
+                for (final peer in _peers)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Chip(label: Text(peer.displayName)),
+                  ),
+              ],
+            ),
+          ),
+        Expanded(
+          child: ListView.builder(
+            padding: const EdgeInsets.all(12),
+            itemCount: _messages.length,
+            itemBuilder: (context, index) {
+              final message = _messages[index];
+              return Align(
+                alignment: message.isLocal
+                    ? Alignment.centerRight
+                    : Alignment.centerLeft,
+                child: Card(
+                  color: message.isLocal
+                      ? Theme.of(context).colorScheme.primaryContainer
+                      : null,
+                  child: Padding(
+                    padding: const EdgeInsets.all(10),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          message.senderId,
+                          style: Theme.of(context).textTheme.labelSmall,
+                        ),
+                        Text(message.text),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+          child: Row(
             children: [
-              FilledButton(
-                onPressed: _requestPermissions,
-                child: const Text('Permissions'),
+              Expanded(
+                child: TextField(
+                  controller: _text,
+                  enabled: _running,
+                  onSubmitted: (_) => _send(),
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    hintText: 'Message #general',
+                  ),
+                ),
               ),
-              FilledButton(
-                onPressed: _transport.isRunning ? null : _start,
-                child: const Text('Start'),
-              ),
-              FilledButton.tonal(
-                onPressed: _transport.isRunning ? _stop : null,
-                child: const Text('Stop'),
-              ),
-              OutlinedButton(
-                onPressed: _links.isEmpty ? null : _broadcastPing,
-                child: const Text('Broadcast ping'),
-              ),
-              OutlinedButton(
-                onPressed: () => _transport.refreshLinks(),
-                child: const Text('Refresh links'),
+              IconButton.filled(
+                onPressed: _running ? _send : null,
+                icon: const Icon(Icons.send),
               ),
             ],
           ),
-          SwitchListTile(
-            value: _echo,
-            onChanged: (value) => setState(() => _echo = value),
-            title: const Text('Echo inbound frames'),
-            subtitle: const Text('Reply on the same link so round trips are measurable'),
-          ),
-          const Divider(),
-          Text('links (${_links.length})', style: Theme.of(context).textTheme.titleMedium),
-          if (_links.isEmpty)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 8),
-              child: Text('No links. Start the transport on two devices.'),
-            ),
-          for (final link in _links)
-            ListTile(
-              dense: true,
-              title: Text(link.linkId),
-              subtitle: Text(
-                'role=${link.role.name} · maxFrame=${link.maxFrameSize}B · '
-                'rssi=${link.rssi ?? '?'} · remote=${link.remoteId}',
-              ),
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
+        ),
+        ExpansionTile(
+          title: const Text('Diagnostics'),
+          children: [
+            SizedBox(
+              height: 120,
+              child: ListView(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
                 children: [
-                  IconButton(
-                    tooltip: 'Ping',
-                    icon: const Icon(Icons.send),
-                    onPressed: () => _pingLink(link),
-                  ),
-                  IconButton(
-                    tooltip: 'Disconnect',
-                    icon: const Icon(Icons.link_off),
-                    onPressed: () => _transport.disconnect(link.linkId),
-                  ),
+                  for (final entry in _log)
+                    Text(
+                      entry,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11,
+                      ),
+                    ),
                 ],
               ),
             ),
-          const Divider(),
-          Text('log', style: Theme.of(context).textTheme.titleMedium),
-          for (final entry in _log)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 2),
-              child: Text(
-                '${entry.at.toIso8601String().substring(11, 23)} '
-                '[${entry.kind}] ${entry.message}',
-                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
+          ],
+        ),
+      ],
+    ),
+  );
 }
