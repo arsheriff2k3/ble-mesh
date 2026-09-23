@@ -15,6 +15,7 @@ import Foundation
 public class BleMeshPlugin: NSObject, FlutterPlugin, BleMeshHostApi {
   private let events = BleEventBus()
   private lazy var controller = BleController(events: events)
+  private var keys: FlutterMethodChannel?
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     #if os(iOS)
@@ -26,6 +27,7 @@ public class BleMeshPlugin: NSObject, FlutterPlugin, BleMeshHostApi {
     let instance = BleMeshPlugin()
     BleMeshHostApiSetup.setUp(binaryMessenger: messenger, api: instance)
     EventsStreamHandler.register(with: messenger, streamHandler: instance.events)
+    instance.keys = KeyVault.register(with: messenger)
 
     // Without this the registrar is the only owner and the plugin — along with
     // both CoreBluetooth managers — is deallocated the moment registration

@@ -1,15 +1,21 @@
 import 'chat_models.dart';
+import 'crypto/chat_keys.dart';
 
 class ReceivedChatPacket {
   const ReceivedChatPacket({
     required this.packet,
     required this.transportId,
     required this.routeId,
+    this.senderKeys,
   });
 
   final ChatPacket packet;
   final String transportId;
   final String routeId;
+
+  /// Keys from the announcement that introduced this sender, when the
+  /// transport authenticates its peers.
+  final ChatPublicKeys? senderKeys;
 }
 
 class ChatTransportSendResult {

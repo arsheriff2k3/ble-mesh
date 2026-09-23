@@ -17,6 +17,8 @@ environment:
   flutter: '>=3.32.0'
 
 dependencies:
+  crypto: ^3.0.7
+  cryptography: ^2.9.0
   flutter:
     sdk: flutter
 

@@ -30,6 +30,7 @@ class FileMessageStore implements MessageStore {
     required this.file,
     this.maximumQueuedPackets = 1024,
     this.maximumMessages = 4096,
+    this.maximumSeenPackets = 65536,
     this.compactionThresholdBytes = 512 * 1024,
     this.codec = const ChatPacketCodec(),
     DateTime Function()? clock,
@@ -45,11 +46,13 @@ class FileMessageStore implements MessageStore {
     String path, {
     int maximumQueuedPackets = 1024,
     int maximumMessages = 4096,
+    int maximumSeenPackets = 65536,
     DateTime Function()? clock,
   }) => FileMessageStore(
     file: File(path),
     maximumQueuedPackets: maximumQueuedPackets,
     maximumMessages: maximumMessages,
+    maximumSeenPackets: maximumSeenPackets,
     clock: clock,
   );
 
@@ -65,6 +68,7 @@ class FileMessageStore implements MessageStore {
   final File file;
   final int maximumQueuedPackets;
   final int maximumMessages;
+  final int maximumSeenPackets;
   final int compactionThresholdBytes;
   final ChatPacketCodec codec;
   final DateTime Function() _clock;
@@ -74,9 +78,12 @@ class FileMessageStore implements MessageStore {
   final Map<String, int> _messageBytes = {};
   final Map<String, MessageState> _states = {};
   final Map<String, DateTime> _seen = {};
+  final Set<String> _incompatiblePackets = {};
 
   RandomAccessFile? _handle;
   Future<void> _writes = Future<void>.value();
+  Future<void> _operations = Future<void>.value();
+  bool _writeFailed = false;
   bool _open = false;
 
   /// Bytes of log that no longer describe live state, used to decide when
@@ -95,56 +102,72 @@ class FileMessageStore implements MessageStore {
     _open = true;
     // Expiry is enforced on read, but compacting here keeps a store that sat
     // unopened for a long time from replaying a large dead log every launch.
-    if (_shouldCompact) await _compact();
+    if (_shouldCompact || file.lengthSync() > compactionThresholdBytes * 4) {
+      await _compact();
+    }
   }
 
   @override
-  Future<void> enqueue(ChatPacket packet) async {
+  Future<void> enqueue(ChatPacket packet) => _mutate(() async {
     _requireOpen();
-    _purgeExpired();
+    _purgeExpiredSeen();
     if (!_packets.containsKey(packet.id) &&
-        _packets.length >= maximumQueuedPackets) {
+        _packets.values.where((item) => !item.isExpired(_clock())).length >=
+            maximumQueuedPackets) {
       throw MessageStoreFullException(
         queuedPackets: _packets.length,
         maximumQueuedPackets: maximumQueuedPackets,
       );
     }
-    if (_packets.containsKey(packet.id)) _deadBytes += codec.encode(packet).length;
+    final encoded = codec.encode(packet);
+    await _append(_recordEnqueue, encoded);
+    final old = _packets[packet.id];
+    if (old != null) _deadBytes += codec.encode(old).length;
     _packets[packet.id] = packet;
-    await _append(_recordEnqueue, codec.encode(packet));
-  }
+  });
 
   @override
-  Future<void> remove(String packetId) async {
+  Future<void> remove(String packetId) => _mutate(() async {
     _requireOpen();
-    final removed = _packets.remove(packetId);
+    final removed = _packets[packetId];
     if (removed == null) return;
-    _deadBytes += codec.encode(removed).length;
     await _append(_recordRemove, utf8.encode(packetId));
-  }
+    _packets.remove(packetId);
+    _deadBytes += codec.encode(removed).length;
+  });
 
   @override
   Future<List<ChatPacket>> queued() async {
     _requireOpen();
-    _purgeExpired();
-    return List.unmodifiable(_packets.values);
+    _purgeExpiredSeen();
+    return List.unmodifiable(
+      _packets.values.where((item) => !item.isExpired(_clock())),
+    );
   }
 
   @override
-  Future<void> saveMessage(ChatMessage message) async {
+  Future<List<ChatPacket>> expiredQueued() async {
+    _requireOpen();
+    return List.unmodifiable(
+      _packets.values.where((item) => item.isExpired(_clock())),
+    );
+  }
+
+  @override
+  Future<void> saveMessage(ChatMessage message) => _mutate(() async {
     _requireOpen();
     if (_messages.containsKey(message.id)) return;
     final payload = utf8.encode(jsonEncode(_encodeMessage(message)));
+    await _append(_recordMessage, payload);
     _messages[message.id] = message;
     _messageBytes[message.id] = payload.length;
-    await _append(_recordMessage, payload);
     while (_messages.length > maximumMessages) {
       final oldest = _messages.keys.first;
       _messages.remove(oldest);
       _states.remove(oldest);
       _deadBytes += _messageBytes.remove(oldest) ?? 0;
     }
-  }
+  });
 
   @override
   Future<List<ChatMessage>> messages() async {
@@ -153,16 +176,17 @@ class FileMessageStore implements MessageStore {
   }
 
   @override
-  Future<void> saveState(String messageId, MessageState state) async {
-    _requireOpen();
-    if (_states[messageId] == state) return;
-    if (_states.containsKey(messageId)) _deadBytes += 48;
-    _states[messageId] = state;
-    await _append(
-      _recordState,
-      utf8.encode(jsonEncode({'id': messageId, 'state': state.name})),
-    );
-  }
+  Future<void> saveState(String messageId, MessageState state) =>
+      _mutate(() async {
+        _requireOpen();
+        if (_states[messageId] == state) return;
+        await _append(
+          _recordState,
+          utf8.encode(jsonEncode({'id': messageId, 'state': state.name})),
+        );
+        if (_states.containsKey(messageId)) _deadBytes += 48;
+        _states[messageId] = state;
+      });
 
   @override
   Future<Map<String, MessageState>> states() async {
@@ -171,71 +195,107 @@ class FileMessageStore implements MessageStore {
   }
 
   @override
-  Future<void> rememberSeen(String packetId, DateTime expiresAt) async {
-    _requireOpen();
-    _purgeExpired();
-    if (_seen.containsKey(packetId)) return;
-    _seen[packetId] = expiresAt;
-    await _append(
-      _recordSeen,
-      utf8.encode(
-        jsonEncode({
-          'id': packetId,
-          'expiresAt': expiresAt.toUtc().millisecondsSinceEpoch,
-        }),
-      ),
-    );
-  }
+  Future<void> rememberSeen(String packetId, DateTime expiresAt) =>
+      _mutate(() async {
+        _requireOpen();
+        _purgeExpiredSeen();
+        if (_seen.containsKey(packetId)) return;
+        if (_seen.length >= maximumSeenPackets) {
+          throw SeenPacketQuotaException(maximumSeenPackets);
+        }
+        await _append(
+          _recordSeen,
+          utf8.encode(
+            jsonEncode({
+              'id': packetId,
+              'expiresAt': expiresAt.toUtc().millisecondsSinceEpoch,
+            }),
+          ),
+        );
+        _seen[packetId] = expiresAt;
+      });
 
   @override
   Future<Map<String, DateTime>> seen() async {
     _requireOpen();
-    _purgeExpired();
+    _purgeExpiredSeen();
     return Map.unmodifiable(_seen);
+  }
+
+  @override
+  Future<bool> hasSeen(String packetId) async {
+    _requireOpen();
+    _purgeExpiredSeen();
+    return _seen.containsKey(packetId);
   }
 
   @override
   Future<void> close() async {
     if (!_open) return;
+    await _operations;
     _open = false;
     await _writes;
-    await _handle?.flush();
-    await _handle?.close();
-    _handle = null;
-    _packets.clear();
-    _messages.clear();
-    _messageBytes.clear();
-    _states.clear();
-    _seen.clear();
-    _deadBytes = 0;
+    try {
+      if (!_writeFailed) await _handle?.flush();
+    } finally {
+      await _handle?.close();
+      _handle = null;
+      _packets.clear();
+      _messages.clear();
+      _messageBytes.clear();
+      _states.clear();
+      _seen.clear();
+      _incompatiblePackets.clear();
+      _deadBytes = 0;
+      _writeFailed = false;
+    }
   }
 
   bool get _shouldCompact =>
-      _deadBytes > compactionThresholdBytes ||
-      (file.existsSync() && file.lengthSync() > compactionThresholdBytes * 4);
+      _deadBytes > compactionThresholdBytes &&
+      _deadBytes * 3 >= file.lengthSync();
+
+  /// Keeps disk writes, in-memory state, and compaction in the same order.
+  Future<void> _mutate(Future<void> Function() operation) {
+    final result = _operations.then((_) async {
+      await operation();
+      if (_shouldCompact) await _compact();
+    });
+    _operations = result.catchError((Object _) {});
+    return result;
+  }
 
   void _requireOpen() {
     if (!_open) throw StateError('FileMessageStore.open() has not completed');
   }
 
-  void _purgeExpired() {
+  void _purgeExpiredSeen() {
     final now = _clock();
-    _packets.removeWhere((_, packet) {
-      final expired = packet.isExpired(now);
-      if (expired) _deadBytes += codec.encode(packet).length;
-      return expired;
+    _seen.removeWhere((_, expiry) {
+      if (expiry.isAfter(now)) return false;
+      _deadBytes += 64;
+      return true;
     });
-    _seen.removeWhere((_, expiry) => !expiry.isAfter(now));
   }
 
   /// Serializes appends so two concurrent callers cannot interleave a record.
   Future<void> _append(int type, List<int> payload) {
     final record = _frame(type, payload);
     final write = _writes.then((_) async {
+      if (_writeFailed) {
+        throw StateError('store write failed; close and reopen before writing');
+      }
       final handle = _handle;
-      if (handle == null) return;
-      await handle.writeFrom(record);
-      await handle.flush();
+      if (handle == null) throw StateError('message store is closed');
+      try {
+        await handle.writeFrom(record);
+        await handle.flush();
+      } on Object {
+        // A partial append can leave a torn record. Reopening trims it before
+        // any later append, so no record is hidden behind the torn tail.
+        _writeFailed = true;
+        rethrow;
+      }
     });
     _writes = write.catchError((Object _) {});
     return write;
@@ -295,6 +355,11 @@ class FileMessageStore implements MessageStore {
       lastGood = offset;
     }
 
+    for (final id in _incompatiblePackets) {
+      if (_states[id] != MessageState.delivered) {
+        _states[id] = MessageState.failed;
+      }
+    }
     if (lastGood != bytes.length) {
       // A torn tail from an abrupt exit. Everything up to lastGood is intact,
       // so trim rather than discard the file.
@@ -310,6 +375,14 @@ class FileMessageStore implements MessageStore {
     try {
       switch (type) {
         case _recordEnqueue:
+          // Older signatures use ambiguous field boundaries. Never resend
+          // them, but preserve history and later records during an upgrade.
+          if (payload.length >= 46 && payload[2] < 3) {
+            _incompatiblePackets.add(
+              packetIdToHex(Uint8List.sublistView(payload, 22, 38)),
+            );
+            return true;
+          }
           final packet = codec.decode(payload);
           _packets[packet.id] = packet;
         case _recordRemove:
@@ -318,7 +391,17 @@ class FileMessageStore implements MessageStore {
           final message = _decodeMessage(
             jsonDecode(utf8.decode(payload)) as Map<String, dynamic>,
           );
+          if (_messageBytes.containsKey(message.id)) {
+            _deadBytes += _messageBytes[message.id]!;
+          }
           _messages[message.id] = message;
+          _messageBytes[message.id] = payload.length;
+          while (_messages.length > maximumMessages) {
+            final oldest = _messages.keys.first;
+            _messages.remove(oldest);
+            _states.remove(oldest);
+            _deadBytes += _messageBytes.remove(oldest) ?? 0;
+          }
         case _recordState:
           final json = jsonDecode(utf8.decode(payload)) as Map<String, dynamic>;
           final name = json['state'] as String;
@@ -344,7 +427,7 @@ class FileMessageStore implements MessageStore {
 
   /// Rewrites the log as the shortest sequence describing current state.
   Future<void> _compact() async {
-    _purgeExpired();
+    _purgeExpiredSeen();
     await _writes;
     final builder = BytesBuilder()..add(_header());
     for (final packet in _packets.values) {
@@ -352,7 +435,10 @@ class FileMessageStore implements MessageStore {
     }
     for (final message in _messages.values) {
       builder.add(
-        _frame(_recordMessage, utf8.encode(jsonEncode(_encodeMessage(message)))),
+        _frame(
+          _recordMessage,
+          utf8.encode(jsonEncode(_encodeMessage(message))),
+        ),
       );
     }
     for (final entry in _states.entries) {
@@ -382,8 +468,11 @@ class FileMessageStore implements MessageStore {
     final temporary = File('${file.path}.compacting');
     await temporary.writeAsBytes(builder.toBytes(), flush: true);
     await _handle?.close();
-    await temporary.rename(file.path);
-    _handle = await file.open(mode: FileMode.append);
+    try {
+      await temporary.rename(file.path);
+    } finally {
+      _handle = await file.open(mode: FileMode.append);
+    }
     _deadBytes = 0;
   }
 

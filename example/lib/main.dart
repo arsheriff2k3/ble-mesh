@@ -1,6 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 
 import 'package:ble_mesh/ble_mesh.dart';
 import 'package:ble_mesh/file_store.dart';
@@ -33,6 +33,8 @@ const _generalChannel = 'general';
 
 class _ChatPageState extends State<ChatPage> {
   ChatIdentity? _identity;
+  IdentityStore? _identityStore;
+  PacketSecurity? _security;
   BleMeshTransport? _ble;
   BleChatTransport? _chatTransport;
   BleMeshChat? _chat;
@@ -46,6 +48,9 @@ class _ChatPageState extends State<ChatPage> {
   List<BleLink> _links = const [];
   BleAdapterState _adapter = BleAdapterState.unknown;
   bool _running = false;
+  bool _restartRequired = false;
+  Object? _startupError;
+  final Set<String> _rotationPrompts = {};
 
   /// `null` selects [_generalChannel]; otherwise the peer being messaged.
   String? _selectedPeerId;
@@ -55,7 +60,11 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void initState() {
     super.initState();
-    unawaited(_bootstrap());
+    unawaited(
+      _bootstrap().catchError((Object error) {
+        if (mounted) setState(() => _startupError = error);
+      }),
+    );
   }
 
   /// Loads the durable identity and store before wiring anything up.
@@ -65,18 +74,55 @@ class _ChatPageState extends State<ChatPage> {
   /// conversation would point at a peer nobody recognises.
   Future<void> _bootstrap() async {
     final directory = await getApplicationSupportDirectory();
-    final identity = await _loadIdentity(File('${directory.path}/identity'));
+
+    // Private keys go to Android Keystore / iOS Keychain; pinned peer keys are
+    // public, so they sit beside the message log.
+    final identityStore = PlatformIdentityStore(
+      fallback: FileIdentityStore(directory: directory),
+    );
+    final marker = File('${directory.path}/identity.peer');
+    final previousId = await marker.exists()
+        ? await marker.readAsString()
+        : null;
+    final keys = await loadOrCreateIdentity(identityStore);
+    if (previousId != null && previousId != keys.peerId) {
+      _append(
+        'Identity changed: $previousId -> ${keys.peerId}. Old direct messages remain addressed to the old device.',
+      );
+    }
+    await marker.writeAsString(keys.peerId, flush: true);
+    final security = PacketSecurity(
+      identity: keys,
+      trustStore: await identityStore.loadTrust(),
+    );
+
+    // The peer id is the fingerprint of the signing key, not a random label,
+    // so it cannot be claimed by another device.
+    final identity = ChatIdentity(
+      peerId: keys.peerId,
+      displayName: 'Phone ${keys.peerId.substring(5, 11)}',
+    );
     final chat = BleMeshChat(
+      security: security,
+      groupStore: PlatformGroupStore(
+        fallback: FileGroupStore(File('${directory.path}/groups.keys')),
+      ),
       store: FileMessageStore.at('${directory.path}/chat.log'),
       // Space out a backlog so a reconnect after a long offline stretch does
       // not hit neighbours with everything at once.
       retrySpacing: const Duration(milliseconds: 120),
     );
     final ble = BleMeshTransport();
-    final chatTransport = BleChatTransport(identity: identity, transport: ble);
+    final chatTransport = BleChatTransport(
+      identity: identity,
+      transport: ble,
+      security: security,
+    );
     if (!mounted) return;
     setState(() {
       _identity = identity;
+      _identityStore = identityStore;
+      _security = security;
       _ble = ble;
       _chat = chat;
       _chatTransport = chatTransport;
@@ -84,25 +130,6 @@ class _ChatPageState extends State<ChatPage> {
     _listen(chat, chatTransport, ble);
     _append('identity ${identity.peerId}');
     unawaited(_refreshAdapter());
-  }
-
-  Future<ChatIdentity> _loadIdentity(File file) async {
-    if (file.existsSync()) {
-      final saved = (await file.readAsString()).trim();
-      if (saved.isNotEmpty) {
-        return ChatIdentity(
-          peerId: saved,
-          displayName: 'Phone ${saved.split('-').last}',
-        );
-      }
-    }
-    final suffix = Random.secure()
-        .nextInt(0xffffff)
-        .toRadixString(16)
-        .padLeft(6, '0');
-    await file.parent.create(recursive: true);
-    await file.writeAsString('peer-$suffix', flush: true);
-    return ChatIdentity(peerId: 'peer-$suffix', displayName: 'Phone $suffix');
   }
 
   void _listen(
@@ -121,9 +148,27 @@ class _ChatPageState extends State<ChatPage> {
           }
         });
       }),
+      chat.groupChanges.listen((_) {
+        if (mounted) setState(() {});
+      }),
       chat.peers.listen((peers) {
         if (!mounted) return;
         setState(() => _peers = peers);
+        for (final peer in peers) {
+          if (peer.trust == PeerTrust.firstContact) {
+            _append('pinned ${peer.displayName} (${peer.id})');
+          }
+        }
+        // Persist the pin so the same peer is recognised after a restart.
+        final security = _security;
+        final store = _identityStore;
+        if (security != null && store != null) {
+          unawaited(
+            store.saveTrust(security.trustStore).catchError((Object error) {
+              _append('Could not save peer trust: $error');
+            }),
+          );
+        }
       }),
       chat.messageStates.listen((state) {
         if (mounted) {
@@ -132,7 +177,7 @@ class _ChatPageState extends State<ChatPage> {
         _append('${state.messageId.substring(0, 8)}: ${state.state.name}');
       }),
       chat.errors.listen((error) => _append('chat error: $error')),
-      chatTransport.errors.listen((error) => _append('BLE chat error: $error')),
+      chatTransport.errors.listen(_onSecurityError),
       ble.adapterState.listen((state) {
         if (!mounted) return;
         setState(() => _adapter = state);
@@ -150,6 +195,7 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _start() async {
+    if (_restartRequired) return;
     final ble = _ble;
     final chat = _chat;
     final identity = _identity;
@@ -184,6 +230,7 @@ class _ChatPageState extends State<ChatPage> {
     for (final message in _messages) {
       threads.add(message.threadId);
     }
+    threads.addAll(_chat?.groups.keys ?? const <String>[]);
     final selected = _selectedPeerId;
     if (selected != null) threads.add(selected);
     return threads.toList();
@@ -195,6 +242,9 @@ class _ChatPageState extends State<ChatPage> {
 
   String _labelFor(String thread) {
     if (thread == _generalChannel) return '#$_generalChannel';
+    if (_chat?.groups.containsKey(thread) ?? false) {
+      return 'Group ${thread.split('/').last.substring(0, 6)}';
+    }
     for (final peer in _peers) {
       if (peer.id == thread) return peer.displayName;
     }
@@ -203,6 +253,29 @@ class _ChatPageState extends State<ChatPage> {
 
   bool _isConnected(String thread) =>
       thread == _generalChannel || _peers.any((peer) => peer.id == thread);
+
+  bool _hasKeyFor(String thread) {
+    if (thread == _generalChannel) return false;
+    if (_chat?.groups.containsKey(thread) ?? false) return true;
+    for (final peer in _peers) {
+      if (peer.id == thread) return peer.canReceiveDirect;
+    }
+    return _security?.trustStore.keysFor(thread) != null;
+  }
+
+  /// Whether we hold a verified key for the selected peer. Without one a
+  /// direct message cannot be sealed, and the plugin refuses to send it in
+  /// the clear.
+  bool get _canEncryptToSelected {
+    final selected = _selectedPeerId;
+    if (selected == null || (_chat?.groups.containsKey(selected) ?? false)) {
+      return true;
+    }
+    for (final peer in _peers) {
+      if (peer.id == selected) return peer.canReceiveDirect;
+    }
+    return _security?.trustStore.keysFor(selected) != null;
+  }
 
   void _selectThread(String thread) => setState(() {
     _selectedPeerId = thread == _generalChannel ? null : thread;
@@ -219,11 +292,133 @@ class _ChatPageState extends State<ChatPage> {
     try {
       if (peerId == null) {
         await chat.send(conversationId: _generalChannel, text: value);
+      } else if (chat.groups.containsKey(peerId)) {
+        await chat.sendGroup(groupId: peerId, text: value);
       } else {
         await chat.sendDirect(peerId: peerId, text: value);
       }
     } on Object catch (error) {
       _append('send failed: $error');
+    }
+  }
+
+  Future<void> _createGroup() async {
+    final chat = _chat;
+    if (chat == null || !_running) return;
+    final candidates = _peers.where((peer) => peer.canReceiveDirect).toList();
+    final selected = <String>{};
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('Create encrypted group'),
+          content: SizedBox(
+            width: 320,
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                for (final peer in candidates)
+                  CheckboxListTile(
+                    title: Text(peer.displayName),
+                    subtitle: Text(peer.id),
+                    value: selected.contains(peer.id),
+                    onChanged: (value) => update(() {
+                      if (value == true) {
+                        selected.add(peer.id);
+                      } else {
+                        selected.remove(peer.id);
+                      }
+                    }),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: selected.isEmpty
+                  ? null
+                  : () => Navigator.pop(context, true),
+              child: const Text('Create'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (approved != true) return;
+    try {
+      final group = await chat.createGroup(memberIds: selected);
+      if (mounted) _selectThread(group.id);
+      _append('Created group ${group.id}, epoch ${group.epoch}');
+    } catch (error) {
+      _append('group creation failed: $error');
+    }
+  }
+
+  Future<void> _changeGroupMember() async {
+    final chat = _chat;
+    final selfId = _identity?.peerId;
+    final group = chat?.groups[_thread];
+    if (chat == null ||
+        selfId == null ||
+        group == null ||
+        group.ownerId != selfId) {
+      return;
+    }
+    final candidates = {...group.members, ..._peers.map((peer) => peer.id)}
+      ..remove(selfId);
+    final selected = {...group.members}..remove(selfId);
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('Change group members'),
+          content: SizedBox(
+            width: 320,
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                for (final id in candidates)
+                  CheckboxListTile(
+                    title: Text(_labelFor(id)),
+                    subtitle: Text(id),
+                    value: selected.contains(id),
+                    onChanged: (value) => update(() {
+                      if (value == true) {
+                        selected.add(id);
+                      } else {
+                        selected.remove(id);
+                      }
+                    }),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Rotate key'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (approved != true) return;
+    try {
+      final next = await chat.changeGroupMembers(
+        groupId: group.id,
+        memberIds: selected,
+      );
+      _append('Group key rotated to epoch ${next.epoch}');
+    } catch (error) {
+      _append('group change failed: $error');
     }
   }
 
@@ -245,6 +440,98 @@ class _ChatPageState extends State<ChatPage> {
     super.dispose();
   }
 
+  void _onSecurityError(Object error) {
+    _append('BLE chat error: $error');
+    if (error is PeerKeyChangedException &&
+        _rotationPrompts.add(error.peerId)) {
+      unawaited(
+        _approveRotation(error).catchError((Object failure) {
+          _append('Could not approve key change: $failure');
+        }),
+      );
+    }
+  }
+
+  Future<void> _approveRotation(PeerKeyChangedException error) async {
+    if (!mounted) return;
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Peer encryption key changed'),
+        content: SelectableText(
+          'Compare this key with the peer before accepting.\n'
+          '${error.peerId}\n${base64Encode(error.proposedKeys.agreement)}',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Reject'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Accept'),
+          ),
+        ],
+      ),
+    );
+    if (accepted != true || !mounted) return;
+    final security = _security!;
+    final previous = security.trustStore.keysFor(error.peerId);
+    security.trustStore.acceptRotation(error.peerId, error.proposedKeys);
+    try {
+      await _identityStore!.saveTrust(security.trustStore);
+    } catch (_) {
+      if (previous != null) {
+        security.trustStore.acceptRotation(error.peerId, previous);
+      }
+      rethrow;
+    }
+    _chatTransport?.refreshTrust();
+    _append('Approved new key for ${error.peerId}; authentication will retry.');
+  }
+
+  Future<void> _rotateOwnKey() async {
+    final security = _security;
+    final store = _identityStore;
+    if (security == null || store == null) return;
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Rotate encryption key?'),
+        content: const Text(
+          'Peers must approve the replacement. Messages encrypted to the old key will no longer decrypt. Restart this app after rotation.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Rotate'),
+          ),
+        ],
+      ),
+    );
+    if (accepted != true) return;
+    try {
+      final replacement = await security.identity.rotateAgreementKey();
+      await store.save(replacement);
+      await _chatTransport?.stop();
+      if (mounted) {
+        setState(() {
+          _running = false;
+          _restartRequired = true;
+        });
+      }
+      _append(
+        'Key rotated. Restart the app before chatting. New agreement key: ${base64Encode(replacement.publicKeys.agreement)}',
+      );
+    } catch (error) {
+      _append('Key rotation failed: $error');
+    }
+  }
+
   Future<void> _disposeTransports() async {
     await _chat?.dispose();
     await _ble?.dispose();
@@ -254,10 +541,43 @@ class _ChatPageState extends State<ChatPage> {
   Widget build(BuildContext context) {
     final identity = _identity;
     if (identity == null) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return Scaffold(
+        body: Center(
+          child: _startupError == null
+              ? const CircularProgressIndicator()
+              : Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    'Could not load the saved identity. Existing keys have been preserved. '
+                    'Resolve the storage error and restart.\n$_startupError',
+                  ),
+                ),
+        ),
+      );
     }
     return Scaffold(
-      appBar: AppBar(title: const Text('ble_mesh chat harness')),
+      appBar: AppBar(
+        title: const Text('ble_mesh chat harness'),
+        actions: [
+          IconButton(
+            tooltip: 'Create encrypted group',
+            onPressed: _running ? _createGroup : null,
+            icon: const Icon(Icons.group_add),
+          ),
+          IconButton(
+            tooltip: 'Change group members',
+            onPressed: _chat?.groups.containsKey(_thread) == true
+                ? _changeGroupMember
+                : null,
+            icon: const Icon(Icons.group),
+          ),
+          IconButton(
+            tooltip: 'Rotate encryption key',
+            onPressed: _restartRequired ? null : _rotateOwnKey,
+            icon: const Icon(Icons.key),
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Material(
@@ -269,8 +589,14 @@ class _ChatPageState extends State<ChatPage> {
                 'peers=${_peers.length}',
               ),
               trailing: FilledButton(
-                onPressed: _running ? null : _start,
-                child: Text(_running ? 'Running' : 'Start'),
+                onPressed: _running || _restartRequired ? null : _start,
+                child: Text(
+                  _restartRequired
+                      ? 'Restart app'
+                      : _running
+                      ? 'Running'
+                      : 'Start',
+                ),
               ),
             ),
           ),
@@ -292,9 +618,13 @@ class _ChatPageState extends State<ChatPage> {
                           onSelected: (_) => _selectThread(thread),
                           avatar: thread == _generalChannel
                               ? const Icon(Icons.tag, size: 18)
+                              : (_chat?.groups.containsKey(thread) ?? false)
+                              ? const Icon(Icons.group, size: 18)
                               : Icon(
-                                  _isConnected(thread)
-                                      ? Icons.smartphone
+                                  _hasKeyFor(thread)
+                                      ? Icons.lock
+                                      : _isConnected(thread)
+                                      ? Icons.lock_open
                                       : Icons.signal_cellular_off,
                                   size: 18,
                                 ),
@@ -354,10 +684,21 @@ class _ChatPageState extends State<ChatPage> {
                       border: const OutlineInputBorder(),
                       hintText: _selectedPeerId == null
                           ? 'Message #$_generalChannel'
+                          : (_chat?.groups.containsKey(_thread) ?? false)
+                          ? 'Encrypted message ${_labelFor(_thread)}'
                           : 'Direct message ${_labelFor(_thread)}',
                       helperText: _selectedPeerId == null
-                          ? null
-                          : 'Direct messages are not encrypted yet (Phase 3)',
+                          ? 'Channel messages are signed but readable'
+                          : (_chat?.groups.containsKey(_thread) ?? false)
+                          ? 'Encrypted group · experimental, unreviewed'
+                          : _canEncryptToSelected
+                          ? 'Encrypted · experimental, unreviewed'
+                          : 'No key for this peer yet — sending will fail',
+                      helperStyle: TextStyle(
+                        color: _selectedPeerId != null && !_canEncryptToSelected
+                            ? Theme.of(context).colorScheme.error
+                            : null,
+                      ),
                     ),
                   ),
                 ),

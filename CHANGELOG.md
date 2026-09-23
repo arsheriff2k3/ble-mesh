@@ -47,3 +47,46 @@ verified on radio hardware — the simulator has no Bluetooth (see
   through an atomic rename.
 - Queued sends retry on a capped exponential backoff, and draining a backlog
   is spaced by `retrySpacing` so a reconnect is not a broadcast burst.
+- Phase 3 (in progress) cryptography, **experimental and unreviewed**: the
+  `x25519-xchacha20poly1305-v1` suite, Ed25519 packet signatures, key-derived
+  peer ids, and trust-on-first-use key pinning. Documented in `docs/CRYPTO.md`.
+- Packet format version 2 carries an optional Ed25519 signature and a sealed
+  payload flag. The signed input excludes TTL so relays can still decrement it.
+- `PacketSecurity.verifyForRelay` lets a relay authenticate a packet it cannot
+  read, so forged packets are dropped before they occupy a packet id.
+- Signed peer announcements carrying public keys, so a peer arrives verifiable
+  and addressable in one frame. An announcement that fails verification is
+  dropped rather than admitted as an unauthenticated peer.
+- Direct messages are sealed end to end and acknowledgements are signed, so
+  `delivered` means the recipient confirmed it rather than a device on the
+  path having claimed so.
+- Private keys live in Android Keystore (AES-GCM wrapped) and the iOS/macOS
+  Keychain, through the new `dev.blemesh.ble_mesh/keys` channel, with a plain
+  file fallback where neither exists.
+- Peer ids are now the fingerprint of the signing key rather than a chosen
+  label. **This invalidates identities and history from earlier builds.**
+
+- Phase 3 review fixes: wire v3 uses length-prefixed signature/AAD fields and
+  carries origin public keys. Reject forged packets before deduplication and
+  require acknowledgements from the original recipient, including after restart.
+- Authenticate each BLE link with a fresh challenge; discover remote peers with
+  bounded signed advertisements. Chat traffic uses authenticated links only.
+- Preserve secure-storage errors, migrate private seeds to one atomic record,
+  and serialize file identity/trust writes. Add agreement-key rotation and an
+  approval prompt in the example. Encryption remains experimental.
+- Wire v1/v2 queues are marked failed on upgrade without discarding history.
+  Upgrade all participating devices together and resend failed old messages.
+
+- Encrypted groups: durable secure group keys, owner-controlled membership,
+  encrypted per-member key updates, epoch rotation after member removal,
+  signed group traffic, and example controls for manual acceptance.
+- Direct packets now remain queued until an authenticated recipient
+  acknowledgement, including offline group key updates. Added deterministic
+  packet/signature/direct/group vectors in `docs/TEST_VECTORS.md`.
+- Add Android, iOS, and macOS example build jobs for CI. Bound inbound and relay
+  work, space backlog sends by default, and retry cached relays after peer
+  topology changes. Recipients re-acknowledge direct retries when needed.
+- Keep expired queued packets until their failed state is persisted. Serialize
+  file-store writes and compaction during long sessions, preserve live state
+  after write failures, and cap retained replay IDs without admitting replays.
+- Forward authenticated encrypted group traffic through nonmember relays.

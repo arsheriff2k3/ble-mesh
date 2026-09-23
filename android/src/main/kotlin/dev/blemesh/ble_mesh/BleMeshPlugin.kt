@@ -7,6 +7,7 @@ import androidx.core.app.ActivityCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.PluginRegistry
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CancellableContinuation
@@ -21,6 +22,7 @@ class BleMeshPlugin :
     private var context: Context? = null
     private var events: BleEventBus? = null
     private var controller: BleController? = null
+    private var keys: MethodChannel? = null
 
     private var activityBinding: ActivityPluginBinding? = null
     private var permissionRequest: CancellableContinuation<BlePermissionState>? = null
@@ -35,10 +37,13 @@ class BleMeshPlugin :
 
         EventsStreamHandler.register(binding.binaryMessenger, eventBus)
         BleMeshHostApi.setUp(binding.binaryMessenger, this)
+        keys = KeyVault.register(binding.binaryMessenger, applicationContext)
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         BleMeshHostApi.setUp(binding.binaryMessenger, null)
+        keys?.setMethodCallHandler(null)
+        keys = null
         controller?.dispose()
         controller = null
         events?.dispose()

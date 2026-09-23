@@ -20,6 +20,17 @@ class MessageStoreFullException implements Exception {
       'queued packets';
 }
 
+/// Thrown rather than forgetting an unexpired packet id and admitting replay.
+class SeenPacketQuotaException implements Exception {
+  const SeenPacketQuotaException(this.maximumSeenPackets);
+
+  final int maximumSeenPackets;
+
+  @override
+  String toString() =>
+      'SeenPacketQuotaException: $maximumSeenPackets unexpired packet ids';
+}
+
 /// Thrown when a store's on-disk format is newer than this build understands.
 class MessageStoreVersionException implements Exception {
   const MessageStoreVersionException({
@@ -56,6 +67,9 @@ abstract interface class MessageStore {
   /// Packets still awaiting delivery, oldest first, excluding expired ones.
   Future<List<ChatPacket>> queued();
 
+  /// Expired pending packets, retained until the facade marks them failed.
+  Future<List<ChatPacket>> expiredQueued();
+
   /// Records a message for conversation history.
   Future<void> saveMessage(ChatMessage message);
 
@@ -74,6 +88,9 @@ abstract interface class MessageStore {
   /// Packet ids seen and not yet expired.
   Future<Map<String, DateTime>> seen();
 
+  /// Checks replay state without copying the whole retained-id index.
+  Future<bool> hasSeen(String packetId);
+
   /// Releases resources. The store must be reopenable afterwards.
   Future<void> close();
 }
@@ -84,11 +101,13 @@ class InMemoryMessageStore implements MessageStore {
   InMemoryMessageStore({
     this.maximumQueuedPackets = 1024,
     this.maximumMessages = 4096,
+    this.maximumSeenPackets = 65536,
     DateTime Function()? clock,
   }) : _clock = clock ?? DateTime.now;
 
   final int maximumQueuedPackets;
   final int maximumMessages;
+  final int maximumSeenPackets;
   final DateTime Function() _clock;
 
   final Map<String, ChatPacket> _packets = {};
@@ -101,9 +120,10 @@ class InMemoryMessageStore implements MessageStore {
 
   @override
   Future<void> enqueue(ChatPacket packet) async {
-    _purgeExpired();
+    _purgeExpiredSeen();
     if (!_packets.containsKey(packet.id) &&
-        _packets.length >= maximumQueuedPackets) {
+        _packets.values.where((item) => !item.isExpired(_clock())).length >=
+            maximumQueuedPackets) {
       throw MessageStoreFullException(
         queuedPackets: _packets.length,
         maximumQueuedPackets: maximumQueuedPackets,
@@ -119,9 +139,16 @@ class InMemoryMessageStore implements MessageStore {
 
   @override
   Future<List<ChatPacket>> queued() async {
-    _purgeExpired();
-    return List.unmodifiable(_packets.values);
+    _purgeExpiredSeen();
+    return List.unmodifiable(
+      _packets.values.where((item) => !item.isExpired(_clock())),
+    );
   }
+
+  @override
+  Future<List<ChatPacket>> expiredQueued() async => List.unmodifiable(
+    _packets.values.where((item) => item.isExpired(_clock())),
+  );
 
   @override
   Future<void> saveMessage(ChatMessage message) async {
@@ -145,22 +172,30 @@ class InMemoryMessageStore implements MessageStore {
 
   @override
   Future<void> rememberSeen(String packetId, DateTime expiresAt) async {
-    _purgeExpired();
+    _purgeExpiredSeen();
+    if (!_seen.containsKey(packetId) && _seen.length >= maximumSeenPackets) {
+      throw SeenPacketQuotaException(maximumSeenPackets);
+    }
     _seen[packetId] = expiresAt;
   }
 
   @override
   Future<Map<String, DateTime>> seen() async {
-    _purgeExpired();
+    _purgeExpiredSeen();
     return Map.unmodifiable(_seen);
+  }
+
+  @override
+  Future<bool> hasSeen(String packetId) async {
+    _purgeExpiredSeen();
+    return _seen.containsKey(packetId);
   }
 
   @override
   Future<void> close() async {}
 
-  void _purgeExpired() {
+  void _purgeExpiredSeen() {
     final now = _clock();
-    _packets.removeWhere((_, packet) => packet.isExpired(now));
     _seen.removeWhere((_, expiry) => !expiry.isAfter(now));
   }
 }
@@ -177,7 +212,7 @@ class DedupeCache {
   void restore(Map<String, DateTime> entries) {
     final now = _clock();
     for (final entry in entries.entries) {
-      if (entry.value.isAfter(now)) _entries[entry.key] = entry.value;
+      if (entry.value.isAfter(now)) remember(entry.key, entry.value);
     }
   }
 

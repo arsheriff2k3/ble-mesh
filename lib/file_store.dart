@@ -5,6 +5,17 @@
 /// transport can run where BLE cannot.
 library;
 
+export 'src/chat/crypto/group_store_io.dart'
+    show FileGroupStore, PlatformGroupStore;
+export 'src/chat/crypto/identity_store.dart'
+    show
+        FileIdentityStore,
+        IdentityStore,
+        PlatformIdentityStore,
+        loadOrCreateIdentity;
 export 'src/chat/file_message_store.dart' show FileMessageStore;
 export 'src/chat/message_store.dart'
-    show MessageStoreFullException, MessageStoreVersionException;
+    show
+        MessageStoreFullException,
+        MessageStoreVersionException,
+        SeenPacketQuotaException;

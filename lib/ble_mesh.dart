@@ -21,6 +21,19 @@ export 'src/chat/chat_models.dart'
         MessageStateChange,
         createPacketId,
         packetIdToHex;
+export 'src/chat/crypto/group_crypto.dart'
+    show ChatGroup, GroupCipher, GroupStore, InMemoryGroupStore;
+export 'src/chat/crypto/chat_keys.dart' show ChatKeyPair, ChatPublicKeys;
+export 'src/chat/crypto/packet_security.dart'
+    show PacketSecurity, VerifiedPacket;
+export 'src/chat/crypto/trust_store.dart' show PeerTrust, TrustStore;
+export 'src/chat/crypto/message_cipher.dart'
+    show
+        MessageCipher,
+        MessageSecurityException,
+        PeerKeyChangedException,
+        SealedMessageCipher,
+        SealedPayload;
 export 'src/chat/chat_transport.dart'
     show ChatTransport, ChatTransportSendResult, ReceivedChatPacket;
 export 'src/chat/fragmentation.dart'

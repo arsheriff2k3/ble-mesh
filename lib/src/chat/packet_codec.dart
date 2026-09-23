@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'chat_models.dart';
+import 'crypto/chat_keys.dart';
 
 class ChatPacketFormatException implements FormatException {
   const ChatPacketFormatException(this.message, [this.source, this.offset]);
@@ -22,8 +23,13 @@ class ChatPacketCodec {
   const ChatPacketCodec({this.maxPacketSize = 64 * 1024});
 
   static const _magic = 0x424d;
-  static const _version = 1;
+  static const _version = 3;
   static const _fixedLength = 46;
+  static const _signatureLength = 128; // public keys (64) + signature (64)
+
+  /// Bit 0 marks a signed packet, bit 1 a sealed payload.
+  static const _flagSigned = 0x01;
+  static const _flagSealed = 0x02;
 
   final int maxPacketSize;
 
@@ -35,8 +41,15 @@ class ChatPacketCodec {
         'sender or destination is too long',
       );
     }
+    final signature = packet.signature;
+    if (signature != null && packet.senderKeys == null) {
+      throw const ChatPacketFormatException(
+        'signed packet requires origin keys',
+      );
+    }
     final size =
         _fixedLength +
+        (signature == null ? 0 : _signatureLength) +
         sender.length +
         destination.length +
         packet.payload.length;
@@ -52,7 +65,11 @@ class ChatPacketCodec {
     data.setUint8(offset++, _version);
     data.setUint8(offset++, packet.type.index);
     data.setUint8(offset++, packet.ttl);
-    data.setUint8(offset++, 0); // Reserved flags.
+    data.setUint8(
+      offset++,
+      (signature == null ? 0 : _flagSigned) |
+          (packet.isSealed ? _flagSealed : 0),
+    );
     data.setInt64(offset, packet.createdAt.millisecondsSinceEpoch);
     offset += 8;
     data.setInt64(offset, packet.expiresAt.millisecondsSinceEpoch);
@@ -65,6 +82,11 @@ class ChatPacketCodec {
     offset += 2;
     data.setUint32(offset, packet.payload.length);
     offset += 4;
+    if (signature != null) {
+      bytes.setRange(offset, offset + 64, packet.senderKeys!.encode());
+      bytes.setRange(offset + 64, offset + _signatureLength, signature);
+      offset += _signatureLength;
+    }
     bytes.setRange(offset, offset + sender.length, sender);
     offset += sender.length;
     bytes.setRange(offset, offset + destination.length, destination);
@@ -95,7 +117,12 @@ class ChatPacketCodec {
     }
     final ttl = data.getUint8(offset++);
     if (ttl == 0) throw const ChatPacketFormatException('TTL must be positive');
-    offset++; // Reserved flags.
+    final flags = data.getUint8(offset++);
+    final signed = flags & _flagSigned != 0;
+    final sealed = flags & _flagSealed != 0;
+    if (flags & ~(_flagSigned | _flagSealed) != 0) {
+      throw const ChatPacketFormatException('unknown packet flags');
+    }
     final createdAtMs = data.getInt64(offset);
     offset += 8;
     final expiresAtMs = data.getInt64(offset);
@@ -119,9 +146,25 @@ class ChatPacketCodec {
     offset += 2;
     final payloadLength = data.getUint32(offset);
     offset += 4;
-    final expected = offset + senderLength + destinationLength + payloadLength;
+    final expected =
+        offset +
+        (signed ? _signatureLength : 0) +
+        senderLength +
+        destinationLength +
+        payloadLength;
     if (expected != bytes.length) {
       throw const ChatPacketFormatException('invalid packet lengths');
+    }
+    Uint8List? signature;
+    ChatPublicKeys? senderKeys;
+    if (signed) {
+      senderKeys = ChatPublicKeys.decode(
+        Uint8List.sublistView(bytes, offset, offset + 64),
+      );
+      signature = Uint8List.fromList(
+        bytes.sublist(offset + 64, offset + _signatureLength),
+      );
+      offset += _signatureLength;
     }
     try {
       final sender = utf8.decode(bytes.sublist(offset, offset + senderLength));
@@ -139,6 +182,9 @@ class ChatPacketCodec {
         createdAt: createdAt,
         expiresAt: expiresAt,
         payload: Uint8List.fromList(bytes.sublist(offset)),
+        signature: signature,
+        senderKeys: senderKeys,
+        isSealed: sealed,
       );
     } on FormatException catch (error) {
       throw ChatPacketFormatException('invalid UTF-8 metadata: $error');
