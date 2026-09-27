@@ -21,20 +21,23 @@ consenting gateway phone.
   hidden-text sanitizer, and fuzzed parsers.
 
 Dual-role (central **and** peripheral) Bluetooth Low Energy byte transport for
-Flutter — the missing layer under a BLE mesh.
+Flutter.
 
 Every device scans and connects out *while* advertising and serving a GATT
-service that neighbours connect into. No published Flutter BLE package does
-both at once, which is why this plugin exists: `flutter_blue_plus` and
-`flutter_reactive_ble` are central-only, `flutter_ble_peripheral` advertises but
-cannot carry data both ways. Without the dual role there is no mesh, only a
-star.
+service that neighbours connect into. Both roles let nearby devices relay
+messages through one another.
 
 Use the included chat layer, or build your own protocol directly on
 the byte transport for telemetry, signed reports, or other offline data.
 
-Android, iOS, and macOS. Web, Windows, and Linux degrade to a documented no-op
-rather than crashing.
+Android, iOS, and macOS support BLE. Web, Windows, and Linux can use the Dart
+chat and Nostr layers, but have no native BLE implementation; a direct BLE
+`start()` call throws a typed unsupported-platform exception.
+
+**Start here:** [Integration guide](doc/GETTING_STARTED.md) covers a complete
+app setup, platform configuration, lifecycle, online-only fallback, and a
+physical-device checklist. [Example app](example/README.md) shows a working
+chat UI and diagnostics.
 
 ## Native scope: a dumb byte pipe
 
@@ -59,7 +62,8 @@ your protocol layer's job, because only it has seen the peer's announce.
 
 ```yaml
 dependencies:
-  ble_mesh_chat: ^0.1.0
+  ble_mesh_chat: ^0.1.2
+  path_provider: ^2.1.6 # only if using the file-backed example below
 ```
 
 ## Usage
@@ -87,6 +91,15 @@ final me = ChatIdentity(peerId: keys.peerId, displayName: 'Alice');
 final ble = BleMeshTransport();
 await ble.requestPermissions();
 
+// Generate these two UUIDs for your app, then use the same pair on every
+// participant. The package defaults are for the example app only.
+final bleConfig = BleMeshTransport.defaultConfig(
+  serviceUuid: 'YOUR-SERVICE-UUID',
+  characteristicUuid: 'YOUR-CHARACTERISTIC-UUID',
+  advertisedName: 'myapp',
+  enableBackground: true,
+);
+
 final chat = BleMeshChat(
   security: security,
   store: FileMessageStore.at('${dir.path}/chat.log'),
@@ -100,7 +113,12 @@ chat.messageStates.listen((change) => print(change.state.name));
 await chat.initialize(
   identity: me,
   transports: [
-    BleChatTransport(identity: me, transport: ble, security: security),
+    BleChatTransport(
+      identity: me,
+      transport: ble,
+      config: bleConfig,
+      security: security,
+    ),
     // Optional: online delivery to contacts through Nostr relays.
     NostrChatTransport(identity: me, relays: const ['wss://relay.example.com']),
   ],
@@ -108,6 +126,10 @@ await chat.initialize(
 
 await chat.send(conversationId: 'general', text: 'Hello mesh!'); // signed, readable
 await chat.sendDirect(peerId: bobPeerId, text: 'Private');      // sealed
+
+// On app shutdown, cancel your stream subscriptions, then:
+await chat.dispose();
+await ble.dispose(); // externally supplied transport stays owned by the app
 ```
 
 A few things to know:
@@ -240,6 +262,7 @@ not there.
 
 | Document | Covers |
 | --- | --- |
+| [GETTING_STARTED.md](doc/GETTING_STARTED.md) | Step-by-step integration and platform setup |
 | [LIMITATIONS.md](doc/LIMITATIONS.md) | Every known security, platform, and resource limit |
 | [CRYPTO.md](doc/CRYPTO.md) | Cryptographic design, trust model, and Nostr metadata |
 | [BRIDGE.md](doc/BRIDGE.md) | Gateways: consent, loops, metadata, data use, battery |

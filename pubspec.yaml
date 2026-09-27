@@ -3,7 +3,7 @@ description: >-
   Flutter plugin providing a dual-role Bluetooth Low Energy transport for
   offline mesh chat. The native layer moves links and frames; routing, queues,
   protocol, and crypto are implemented in shared Dart.
-version: 0.1.1
+version: 0.1.2
 repository: https://github.com/arsheriff2k3/ble-mesh
 topics:
   - bluetooth

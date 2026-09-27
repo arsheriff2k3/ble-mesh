@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.2
+
+- Added an end-to-end integration guide with per-platform setup, persistent
+  identity, app-owned UUIDs, lifecycle, and online-only fallback.
+- Corrected the README install version and chat setup example; clarified the
+  BLE support matrix and public API boundaries.
+
+**Upgrade notes:** No Dart API, wire format, storage format, or platform
+configuration changes. Existing `0.1.1` integrations need no code changes.
+
 ## 0.1.1
 
 - Relays can be changed while running with `NostrChatTransport.setRelays`,
