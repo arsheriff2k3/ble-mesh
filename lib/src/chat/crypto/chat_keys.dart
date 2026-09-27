@@ -9,8 +9,14 @@ import 'package:cryptography/cryptography.dart';
 /// Held as top-level finals rather than constructed per call so a platform
 /// that offers hardware-backed implementations is picked up once.
 final ed25519 = Ed25519();
+
+/// X25519 key agreement (RFC 7748).
 final x25519 = X25519();
+
+/// XChaCha20-Poly1305 AEAD with a 24-byte nonce and 16-byte tag.
 final aead = Xchacha20.poly1305Aead();
+
+/// HKDF-SHA256 producing 32-byte keys.
 final hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
 
 /// The public half of a peer's identity.
@@ -19,6 +25,9 @@ final hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
 /// reusing a single key across both is exactly the kind of shortcut that turns
 /// a reviewed primitive into an unreviewed protocol.
 class ChatPublicKeys {
+  /// Creates keys from raw 32-byte [signing] and [agreement] public keys.
+  ///
+  /// Lengths are not checked here; [decode] checks the combined length.
   const ChatPublicKeys({required this.signing, required this.agreement});
 
   /// Ed25519 public key, 32 bytes. Identity is derived from this.
@@ -35,6 +44,7 @@ class ChatPublicKeys {
   /// produces announcements that fail verification.
   String get peerId => 'peer-${_fingerprint(signing)}';
 
+  /// Wire form: [signing] followed by [agreement], 64 bytes.
   Uint8List encode() {
     final bytes = BytesBuilder()
       ..add(signing)
@@ -42,6 +52,11 @@ class ChatPublicKeys {
     return bytes.toBytes();
   }
 
+  /// Parses the 64-byte output of [encode].
+  ///
+  /// Throws [FormatException] if [bytes] is not exactly 64 bytes. The keys
+  /// are views into [bytes] and are not otherwise validated; parsing grants
+  /// no trust.
   static ChatPublicKeys decode(Uint8List bytes) {
     if (bytes.length != 64) {
       throw const FormatException('peer keys must be 64 bytes');
@@ -50,6 +65,57 @@ class ChatPublicKeys {
       signing: Uint8List.sublistView(bytes, 0, 32),
       agreement: Uint8List.sublistView(bytes, 32, 64),
     );
+  }
+
+  /// Sixty digits two peers compare to confirm they hold each other's keys.
+  ///
+  /// Both sides compute the same number. It covers both parties' signing
+  /// and agreement keys, so it changes after any key rotation. Each half is
+  /// one party's fingerprint, stretched with 5200 hash rounds so that
+  /// grinding a key to match the first few groups a person might check is
+  /// expensive. Compare it in person or over two independent channels:
+  /// voices and video can be synthesized.
+  static String safetyNumber(ChatPublicKeys a, ChatPublicKeys b) {
+    final halves = [_fingerprintDigits(a), _fingerprintDigits(b)]..sort();
+    final digits = halves.join();
+    return [
+      for (var i = 0; i < digits.length; i += 5) digits.substring(i, i + 5),
+    ].join(' ');
+  }
+
+  static String _fingerprintDigits(ChatPublicKeys keys) {
+    final encoded = keys.encode();
+    var hash = _sha256([...utf8.encode('ble_mesh/safety/v1'), ...encoded]);
+    for (var round = 0; round < 5200; round++) {
+      hash = _sha256([...hash, ...encoded]);
+    }
+    final buffer = StringBuffer();
+    for (var group = 0; group < 6; group++) {
+      var value = 0;
+      for (var i = 0; i < 5; i++) {
+        value = value * 256 + hash[group * 5 + i];
+      }
+      buffer.write((value % 100000).toString().padLeft(5, '0'));
+    }
+    return buffer.toString();
+  }
+
+  static const _contactPrefix = 'blemesh1:';
+
+  /// Shareable text form of these keys, for adding a contact who has never
+  /// been in BLE range. Whoever supplies the code decides who you trust, so
+  /// it must arrive over a channel you already trust.
+  String toContactCode() =>
+      '$_contactPrefix${base64Url.encode(encode()).replaceAll('=', '')}';
+
+  /// Parses [toContactCode] output, ignoring surrounding whitespace.
+  static ChatPublicKeys fromContactCode(String code) {
+    final trimmed = code.trim();
+    if (!trimmed.startsWith(_contactPrefix)) {
+      throw const FormatException('not a ble_mesh contact code');
+    }
+    final body = trimmed.substring(_contactPrefix.length);
+    return decode(base64Url.decode(base64Url.normalize(body)));
   }
 
   @override
@@ -64,16 +130,26 @@ class ChatPublicKeys {
 
 /// A peer's own key material, including private keys.
 class ChatKeyPair {
+  /// Creates a key pair from existing parts.
+  ///
+  /// [publicKeys] must match the two key pairs; this is not checked. Prefer
+  /// [generate] or [fromPrivateBytes], which derive it.
   ChatKeyPair({
     required this.signingKeyPair,
     required this.agreementKeyPair,
     required this.publicKeys,
   });
 
+  /// Ed25519 key pair that signs packets and announcements.
   final SimpleKeyPair signingKeyPair;
+
+  /// X25519 key pair that opens messages sealed to this peer.
   final SimpleKeyPair agreementKeyPair;
+
+  /// Public halves of both key pairs, safe to share.
   final ChatPublicKeys publicKeys;
 
+  /// Peer id derived from the signing key; see [ChatPublicKeys.peerId].
   String get peerId => publicKeys.peerId;
 
   /// Generates a fresh identity.

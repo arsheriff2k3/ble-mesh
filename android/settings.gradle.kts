@@ -1,1 +1,1 @@
-rootProject.name = "ble_mesh"
+rootProject.name = "ble_mesh_chat"

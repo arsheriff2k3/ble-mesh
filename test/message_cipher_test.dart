@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:ble_mesh/ble_mesh.dart';
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -150,5 +150,36 @@ void main() {
     final decoded = ChatPublicKeys.decode(encoded);
     expect(decoded.peerId, alice.peerId);
     expect(decoded, alice.publicKeys);
+  });
+
+  test('safety numbers match on both sides and change on rotation', () async {
+    final number = ChatPublicKeys.safetyNumber(
+      alice.publicKeys,
+      bob.publicKeys,
+    );
+    expect(number, matches(RegExp(r'^\d{5}( \d{5}){11}$')));
+    expect(
+      ChatPublicKeys.safetyNumber(bob.publicKeys, alice.publicKeys),
+      number,
+    );
+    final rotated = await alice.rotateAgreementKey();
+    expect(
+      ChatPublicKeys.safetyNumber(rotated.publicKeys, bob.publicKeys),
+      isNot(number),
+    );
+  });
+
+  test('public keys round-trip through a contact code', () async {
+    final code = alice.publicKeys.toContactCode();
+    expect(code, startsWith('blemesh1:'));
+    expect(ChatPublicKeys.fromContactCode('  $code\n'), alice.publicKeys);
+    expect(
+      () => ChatPublicKeys.fromContactCode(code.substring(0, code.length - 4)),
+      throwsFormatException,
+    );
+    expect(
+      () => ChatPublicKeys.fromContactCode('other:${code.substring(9)}'),
+      throwsFormatException,
+    );
   });
 }

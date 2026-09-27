@@ -1,10 +1,10 @@
-name: ble_mesh
+name: ble_mesh_chat
 description: >-
   Flutter plugin providing a dual-role Bluetooth Low Energy transport for
   offline mesh chat. The native layer moves links and frames; routing, queues,
   protocol, and crypto are implemented in shared Dart.
-version: 0.1.0
-publish_to: none
+version: 0.1.1
+repository: https://github.com/arsheriff2k3/ble-mesh
 topics:
   - bluetooth
   - ble
@@ -21,6 +21,11 @@ dependencies:
   cryptography: ^2.9.0
   flutter:
     sdk: flutter
+  meta: ^1.16.0
+  # secp256k1 arithmetic for the vendored BIP-340 code in
+  # lib/src/chat/nostr/bip340.dart.
+  pointycastle: ^4.0.0
+  web_socket_channel: ^3.0.3
 
 dev_dependencies:
   flutter_lints: ^6.0.0

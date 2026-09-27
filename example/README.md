@@ -1,21 +1,31 @@
-# ble_mesh chat harness
+# ble_mesh_chat example
 
-Minimal Phase 1 group-chat and diagnostics harness. It uses the high-level
-`BleMeshChat` API while showing adapter, link, peer, queue, and delivery state.
+A chat and diagnostics app for `ble_mesh_chat`. It uses the high-level
+`BleMeshChat` API and shows adapter, link, peer, relay, and delivery state.
 
 ```bash
-flutter run     # install on three physical devices for the relay test
+flutter run     # install on two or more physical devices
 ```
 
-1. Tap **Start** on all devices and grant permissions.
-2. The link and discovered-peer counts should increase within a few seconds.
-3. Send a line in `#general`; it should show up on every reachable device.
-4. Walk one device out of range and back: the link should drop and re-form.
+1. Tap **Start** on every device and grant the Bluetooth permission.
+2. Link and peer counts rise within a few seconds.
+3. Send a message in `#general`; it shows up on every reachable device.
+4. Select a peer to send an encrypted direct message. It moves from `sent`
+   to `delivered` when the recipient acknowledges it.
+5. For multi-hop delivery, put A and C out of range of each other with B in
+   between. Messages between A and C arrive once, through B.
 
-For multi-hop, place A and C out of range of each other with B in the middle.
-Messages between A and C must arrive once through B. The automated suite models
-this topology, but only this physical test validates the radios.
+Optional features, all in the top bar:
 
-The harness uses the sample UUIDs from `BleMeshUuids`, so every copy of it on
-the same site joins the same network. Your own app should generate its own —
-see the plugin README.
+- **Contacts:** share or paste a contact code to add someone you have not
+  met over Bluetooth.
+- **Online relays:** add `wss://` Nostr relays for delivery over the
+  internet. Changes apply immediately.
+- **Gateway and bridging:** let gateways carry your messages, or act as a
+  gateway for nearby offline devices.
+
+Diagnostics are shown in the app and mirrored to `adb logcat -s flutter`.
+
+The app uses the sample UUIDs from `BleMeshUuids`, so every copy of it
+nearby joins the same network. Your own app should generate its own; see the
+plugin README.

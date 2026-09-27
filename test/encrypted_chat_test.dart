@@ -1,13 +1,13 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:ble_mesh/ble_mesh.dart';
-import 'package:ble_mesh/file_store.dart';
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
+import 'package:ble_mesh_chat/file_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'test_chat_transport.dart';
 
-/// Phase 3 end to end: encryption through the full chat facade, including the
+/// End to end: encryption through the full chat facade, including the
 /// relay that must move a message it cannot read.
 void main() {
   late Directory directory;
@@ -25,7 +25,11 @@ void main() {
     final keys = await ChatKeyPair.generate();
     final security = PacketSecurity(identity: keys);
     return (
-      chat: BleMeshChat(security: security, maximumRelayJitter: Duration.zero),
+      chat: BleMeshChat(
+        security: security,
+        maximumRelayJitter: Duration.zero,
+        minimumRelaySpacing: Duration.zero,
+      ),
       security: security,
       identity: ChatIdentity(peerId: keys.peerId, displayName: name),
     );

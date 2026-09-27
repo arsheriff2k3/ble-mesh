@@ -19,6 +19,12 @@ import 'message_store.dart';
 
 /// Adapts the low-level dual-role BLE byte pipe to complete chat packets.
 class BleChatTransport implements ChatTransport {
+  /// Creates a transport for [identity].
+  ///
+  /// Creates and owns a [BleMeshTransport] when [transport] is omitted; a
+  /// supplied one is not disposed by [dispose]. Throws [ArgumentError] if
+  /// [security] is set and its identity's peer id differs from
+  /// [identity]'s.
   BleChatTransport({
     required this.identity,
     BleMeshTransport? transport,
@@ -27,6 +33,8 @@ class BleChatTransport implements ChatTransport {
     this.fragmenter = const PacketFragmenter(),
     this.security,
     PacketReassembler? reassembler,
+    this.staleLinkAge = const Duration(seconds: 60),
+    this.radioRecoveryInterval = const Duration(seconds: 5),
   }) : _ble = transport ?? BleMeshTransport(),
        _ownsBle = transport == null,
        _reassembler = reassembler ?? PacketReassembler() {
@@ -39,16 +47,33 @@ class BleChatTransport implements ChatTransport {
     }
   }
 
+  /// Local peer id and display name sent in announcements.
   final ChatIdentity identity;
 
   /// When present, announcements are signed and unauthenticated peers are
-  /// refused. Null keeps the pre-Phase-3 plaintext behaviour for tests and
+  /// refused. Null keeps the unauthenticated plaintext behaviour for tests and
   /// for hosts that have not migrated.
   final PacketSecurity? security;
   final BleMeshTransport _ble;
   final bool _ownsBle;
+
+  /// Configuration passed to the BLE transport when [start] starts it.
   final BleConfig? config;
+
+  /// When a peer has several links, one authenticated this much longer ago
+  /// than its newest is presumed dead. A peer that restarts leaves its old
+  /// connection half-open on this side, and keeping that one instead of the
+  /// fresh link would strand every message to it.
+  final Duration staleLinkAge;
+
+  /// While the radio is not running, how often to check whether Bluetooth
+  /// has become available and start it.
+  final Duration radioRecoveryInterval;
+
+  /// Encodes and decodes complete chat packets.
   final ChatPacketCodec codec;
+
+  /// Splits encoded packets to fit each link's maximum frame size.
   final PacketFragmenter fragmenter;
   final PacketReassembler _reassembler;
 
@@ -64,6 +89,7 @@ class BleChatTransport implements ChatTransport {
   final Map<String, Uint8List> _challenges = {};
   final Map<String, DateTime> _challengeTimes = {};
   final Map<String, DateTime> _answeredAt = {};
+  final Map<String, DateTime> _authenticatedAt = {};
   final Map<String, ChatPacket> _advertisements = {};
   final DedupeCache _discoverySeen = DedupeCache();
   Future<void> _frameWork = Future<void>.value();
@@ -71,6 +97,8 @@ class BleChatTransport implements ChatTransport {
   final Set<Future<void>> _backgroundWork = {};
   Timer? _discoveryTimer;
   Timer? _handshakeTimer;
+  Timer? _radioTimer;
+  bool _recoveringRadio = false;
   bool _started = false;
   bool _lastAvailable = false;
 
@@ -85,7 +113,16 @@ class BleChatTransport implements ChatTransport {
   Stream<ReceivedChatPacket> get incoming => _incoming.stream;
   @override
   Stream<List<ChatPeer>> get peers => _peers.stream;
+
+  /// Send failures, inbound packets that fail decoding or verification,
+  /// peer key changes, and errors from the BLE transport. A link that
+  /// vanishes mid-send is not reported.
   Stream<Object> get errors => _errors.stream;
+
+  /// Underlying BLE byte transport.
+  ///
+  /// Frames sent on it directly skip packet encoding, fragmentation, and
+  /// [security].
   BleMeshTransport get rawTransport => _ble;
 
   @override
@@ -94,22 +131,40 @@ class BleChatTransport implements ChatTransport {
     _started = true;
     _subscriptions.addAll([
       _ble.linkUp.listen((link) {
+        // A linkUp is a new connection even when the platform reuses an id
+        // (ids are role + address). It has to prove its identity again.
+        _forgetLink(link.linkId);
+        _publishPeers();
         _publishAvailability();
         _background(() => _beginLink(link.linkId));
       }),
       _ble.linkDown.listen((down) {
-        _peerByLink.remove(down.linkId);
-        _challenges.remove(down.linkId);
-        _challengeTimes.remove(down.linkId);
-        _answeredAt.remove(down.linkId);
-        _reassembler.discardRoute(down.linkId);
+        _forgetLink(down.linkId);
         _publishPeers();
         _publishAvailability();
+      }),
+      // Losing the radio clears links without a linkDown for each, so
+      // reconcile against the live set whenever it changes.
+      _ble.linksChanged.listen((_) => _reconcileLinks()),
+      _ble.adapterState.listen((state) {
+        if (state == BleAdapterState.poweredOn) _background(_recoverRadio);
       }),
       _ble.frames.listen(_onFrame),
       _ble.errors.listen(_errors.add),
     ]);
-    if (!_ble.isRunning) await _ble.start(config: config);
+    if (!_ble.isRunning) {
+      try {
+        await _ble.start(config: config);
+      } on Object catch (error) {
+        // Bluetooth off or permission not yet granted. Keep running and
+        // start the radio when it becomes possible instead of staying
+        // offline for the rest of the session.
+        _errors.add(error);
+      }
+    }
+    _radioTimer = Timer.periodic(radioRecoveryInterval, (_) {
+      if (!_ble.isRunning) _background(_recoverRadio);
+    });
     for (final linkId in _ble.links.keys) {
       _background(() => _beginLink(linkId));
     }
@@ -132,6 +187,8 @@ class BleChatTransport implements ChatTransport {
     _discoveryTimer = null;
     _handshakeTimer?.cancel();
     _handshakeTimer = null;
+    _radioTimer?.cancel();
+    _radioTimer = null;
     for (final subscription in _subscriptions) {
       await subscription.cancel();
     }
@@ -143,11 +200,14 @@ class BleChatTransport implements ChatTransport {
     _challenges.clear();
     _challengeTimes.clear();
     _answeredAt.clear();
+    _authenticatedAt.clear();
     _advertisements.clear();
     _publishPeers();
     _publishAvailability();
   }
 
+  /// Stops the transport, disposes the BLE transport if this instance
+  /// created it, and closes every stream.
   Future<void> dispose() async {
     await stop();
     if (_ownsBle) await _ble.dispose();
@@ -197,6 +257,15 @@ class BleChatTransport implements ChatTransport {
         // fault worth showing: the route simply does not count as delivered
         // and the router queues or retries on what is left.
         if (!_isVanishedLink(error)) _errors.add(error);
+        if (_isDeadLink(error) && _peerByLink.containsKey(link.linkId)) {
+          // A write that fails on an authenticated link usually means the
+          // peer is gone but the connection was never reported down.
+          // Dropping it lets the peer's next connection take over.
+          _forgetLink(link.linkId);
+          _publishPeers();
+          _publishAvailability();
+          _background(() => _ble.disconnect(link.linkId));
+        }
       }
     }
     return ChatTransportSendResult(
@@ -212,6 +281,56 @@ class BleChatTransport implements ChatTransport {
   static bool _isVanishedLink(Object error) =>
       error is BleUnknownLinkException ||
       (error is PlatformException && error.code == 'unknown_link');
+
+  static bool _isDeadLink(Object error) =>
+      error is PlatformException && error.code == 'write_failed';
+
+  /// Forgets everything known about [linkId]'s connection.
+  void _forgetLink(String linkId) {
+    _peerByLink.remove(linkId);
+    _challenges.remove(linkId);
+    _challengeTimes.remove(linkId);
+    _answeredAt.remove(linkId);
+    _authenticatedAt.remove(linkId);
+    _reassembler.discardRoute(linkId);
+  }
+
+  /// Drops state for links the platform no longer has.
+  void _reconcileLinks() {
+    final live = _ble.links.keys.toSet();
+    final known = {
+      ..._peerByLink.keys,
+      ..._challenges.keys,
+      ..._answeredAt.keys,
+      ..._authenticatedAt.keys,
+    };
+    final gone = known.difference(live);
+    if (gone.isEmpty) return;
+    gone.forEach(_forgetLink);
+    _publishPeers();
+    _publishAvailability();
+  }
+
+  /// Starts the radio if the transport is started but the radio is not,
+  /// for example because Bluetooth was off when [start] ran.
+  Future<void> _recoverRadio() async {
+    if (!_started || _ble.isRunning || _recoveringRadio) return;
+    _recoveringRadio = true;
+    try {
+      if (await _ble.currentAdapterState() != BleAdapterState.poweredOn) {
+        return;
+      }
+      await _ble.start(config: config);
+      for (final linkId in _ble.links.keys) {
+        _background(() => _beginLink(linkId));
+      }
+      _publishAvailability();
+    } on Object {
+      // Still unavailable; the next tick or adapter event tries again.
+    } finally {
+      _recoveringRadio = false;
+    }
+  }
 
   void _background(Future<void> Function() action) {
     late final Future<void> work;
@@ -376,6 +495,7 @@ class BleChatTransport implements ChatTransport {
     final keyed = security;
     if (keyed == null) {
       _peerByLink[linkId] = packet.senderId;
+      _authenticatedAt[linkId] = DateTime.now();
       _nameByPeer[packet.senderId] = _decodeName(packet.payload);
       await _suppressDuplicateLinks(packet.senderId);
       _publishPeers();
@@ -408,6 +528,7 @@ class BleChatTransport implements ChatTransport {
     _challenges.remove(linkId);
     _challengeTimes.remove(linkId);
     _peerByLink[linkId] = packet.senderId;
+    _authenticatedAt[linkId] = DateTime.now();
     _keysByPeer[packet.senderId] = keys;
     _trustByPeer[packet.senderId] = trust;
     _nameByPeer[packet.senderId] = _decodeName(
@@ -500,6 +621,13 @@ class BleChatTransport implements ChatTransport {
     }
   }
 
+  /// Keeps one link per peer.
+  ///
+  /// Links authenticated more than [staleLinkAge] before the peer's newest
+  /// are dropped first: they are most likely left over from before the
+  /// peer restarted. Among the rest, both sides make the same choice
+  /// independently: the lower peer id keeps its central link, the higher its
+  /// peripheral link, and link id breaks ties.
   Future<void> _suppressDuplicateLinks(String peerId) async {
     final candidates = _peerByLink.entries
         .where((entry) => entry.value == peerId)
@@ -507,17 +635,29 @@ class BleChatTransport implements ChatTransport {
         .whereType<BleLink>()
         .toList();
     if (candidates.length < 2) return;
+    final epoch = DateTime.fromMillisecondsSinceEpoch(0);
+    DateTime authenticatedAt(BleLink link) =>
+        _authenticatedAt[link.linkId] ?? epoch;
+    final newest = candidates
+        .map(authenticatedAt)
+        .reduce((a, b) => a.isAfter(b) ? a : b);
+    final stale = candidates
+        .where(
+          (link) => newest.difference(authenticatedAt(link)) > staleLinkAge,
+        )
+        .toList();
+    final fresh = candidates.where((link) => !stale.contains(link)).toList();
     final desiredRole = identity.peerId.compareTo(peerId) < 0
         ? BleLinkRole.central
         : BleLinkRole.peripheral;
-    candidates.sort((a, b) {
+    fresh.sort((a, b) {
       final aPreferred = a.role == desiredRole ? 0 : 1;
       final bPreferred = b.role == desiredRole ? 0 : 1;
       final roleOrder = aPreferred.compareTo(bPreferred);
       return roleOrder != 0 ? roleOrder : a.linkId.compareTo(b.linkId);
     });
-    for (final duplicate in candidates.skip(1)) {
-      _peerByLink.remove(duplicate.linkId);
+    for (final duplicate in [...stale, ...fresh.skip(1)]) {
+      _forgetLink(duplicate.linkId);
       await _ble.disconnect(duplicate.linkId);
     }
     _publishPeers();

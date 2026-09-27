@@ -23,12 +23,17 @@ enum PeerTrust {
 /// phones, without demanding a fingerprint comparison that most people will
 /// not complete. It does not protect the very first contact.
 class TrustStore {
+  /// Creates a store seeded with a copy of [pinned], keyed by peer id.
+  ///
+  /// Entries are not checked against their fingerprints.
   TrustStore({Map<String, ChatPublicKeys>? pinned}) : _pinned = {...?pinned};
 
   final Map<String, ChatPublicKeys> _pinned;
 
+  /// Read-only view of every pinned peer id and its keys, for persistence.
   Map<String, ChatPublicKeys> get pinned => Map.unmodifiable(_pinned);
 
+  /// Pinned keys for [peerId], or null if none are pinned.
   ChatPublicKeys? keysFor(String peerId) => _pinned[peerId];
 
   /// Classifies [keys] for [peerId] without changing anything.
@@ -49,6 +54,10 @@ class TrustStore {
   }
 
   /// Accepts a replacement key after the user has approved it.
+  ///
+  /// Throws [ArgumentError] if [keys] do not derive [peerId], so a different
+  /// signing key can never be adopted under an existing id. Only the
+  /// fingerprint is checked; comparing keys out of band is the caller's job.
   void acceptRotation(String peerId, ChatPublicKeys keys) {
     if (keys.peerId != peerId) {
       throw ArgumentError('replacement key must match its fingerprint peer id');
@@ -56,5 +65,6 @@ class TrustStore {
     _pinned[peerId] = keys;
   }
 
+  /// Removes the pin for [peerId]; its next keys count as first contact.
   void forget(String peerId) => _pinned.remove(peerId);
 }

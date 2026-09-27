@@ -1,10 +1,11 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:ble_mesh/ble_mesh.dart';
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
+import 'package:ble_mesh_chat/src/chat/crypto/chat_keys.dart' show ed25519;
 import 'package:flutter_test/flutter_test.dart';
 
-/// Phase 3: everything a relay or an impostor might try against a packet.
+/// Everything a relay or an impostor might try against a packet.
 void main() {
   late ChatKeyPair alice;
   late ChatKeyPair bob;
@@ -170,11 +171,39 @@ void main() {
     );
   });
 
+  /// Signs [packet] with [signer] directly, bypassing the identity check in
+  /// [PacketSecurity.protect], the way a hostile client would.
+  Future<ChatPacket> forge(
+    ChatPacket packet, {
+    required ChatKeyPair signer,
+    ChatPublicKeys? claimedKeys,
+  }) async {
+    final prepared = claimedKeys == null
+        ? packet
+        : packet.withSenderKeys(claimedKeys);
+    final signature = await ed25519.sign(
+      prepared.signingInput,
+      keyPair: signer.signingKeyPair,
+    );
+    return prepared.withSignature(Uint8List.fromList(signature.bytes));
+  }
+
+  test('protect refuses to sign under another identity', () async {
+    await expectLater(
+      PacketSecurity(identity: mallory).protect(
+        plainPacket(sender: alice.peerId, destination: 'c:general'),
+        encrypt: false,
+      ),
+      throwsA(isA<MessageSecurityException>()),
+    );
+  });
+
   test('a packet signed by the wrong key is refused', () async {
-    // Mallory signs but claims to be alice.
-    final forged = await PacketSecurity(identity: mallory).protect(
+    // Mallory signs but claims to be alice, attaching alice's public keys.
+    final forged = await forge(
       plainPacket(sender: alice.peerId, destination: 'c:general'),
-      encrypt: false,
+      signer: mallory,
+      claimedKeys: alice.publicKeys,
     );
     await expectLater(
       bobSide.admit(forged, announcedKeys: alice.publicKeys),
@@ -183,18 +212,25 @@ void main() {
   });
 
   test('a chosen sender id that does not match the key is refused', () async {
-    final forged = await PacketSecurity(
-      identity: mallory,
-    ).protect(plainPacket(sender: 'peer-9950', destination: 'c:general'),
-        encrypt: false);
+    final forged = await forge(
+      plainPacket(sender: 'peer-9950', destination: 'c:general'),
+      signer: mallory,
+      claimedKeys: mallory.publicKeys,
+    );
     await expectLater(
       bobSide.admit(forged, announcedKeys: mallory.publicKeys),
       throwsA(isA<MessageSecurityException>()),
     );
   });
 
-  test('a sender we have never heard announce is refused', () async {
-    final packet = await aliceToBob();
+  test('a sender with no origin keys and no announcement is refused', () async {
+    // Packets normally carry signed origin keys. Without them, and without an
+    // announcement or pin, there is nothing to verify against.
+    final packet = await forge(
+      plainPacket(sender: alice.peerId, destination: 'c:general'),
+      signer: alice,
+    );
+    expect(packet.senderKeys, isNull);
     await expectLater(
       bobSide.admit(packet),
       throwsA(isA<MessageSecurityException>()),
@@ -219,7 +255,9 @@ void main() {
 
   test('an approved rotation replaces the pinned key', () async {
     await bobSide.admit(await aliceToBob(), announcedKeys: alice.publicKeys);
-    final rotated = await ChatKeyPair.generate();
+    // Rotation replaces the agreement key; the signing key, and therefore
+    // the peer id, stays the same.
+    final rotated = await alice.rotateAgreementKey();
 
     bobSide.trustStore.acceptRotation(alice.peerId, rotated.publicKeys);
     expect(
@@ -230,6 +268,14 @@ void main() {
       bobSide.trustStore.classify(alice.peerId, alice.publicKeys),
       PeerTrust.changed,
       reason: 'the old key must stop being trusted',
+    );
+  });
+
+  test('a replacement with a different signing key is rejected', () async {
+    final stranger = await ChatKeyPair.generate();
+    expect(
+      () => bobSide.trustStore.acceptRotation(alice.peerId, stranger.publicKeys),
+      throwsArgumentError,
     );
   });
 

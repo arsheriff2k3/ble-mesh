@@ -16,7 +16,17 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "dev.blemesh.ble_mesh_example"
+        // An alternate ID lets a manual-test build install alongside an
+        // existing copy signed with a different development key.
+        applicationId = providers.gradleProperty("freshInstallApplicationId")
+            .orElse("dev.blemesh.ble_mesh_example")
+            .get()
+        manifestPlaceholders["appLabel"] =
+            if (providers.gradleProperty("freshInstallApplicationId").isPresent) {
+                "ble_mesh_test"
+            } else {
+                "ble_mesh_example"
+            }
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion

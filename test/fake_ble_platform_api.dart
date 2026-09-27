@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:ble_mesh/ble_mesh.dart';
-import 'package:ble_mesh/src/ble_api.g.dart';
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
+import 'package:ble_mesh_chat/src/ble_api.g.dart';
 
 /// A scripted stand-in for the platform channel.
 ///
@@ -26,6 +26,12 @@ class FakeBlePlatformApi implements BlePlatformApi {
   final Map<String, Object> sendFailures = {};
 
   List<BleLink> platformLinks = const [];
+
+  /// Reported by [adapterState].
+  BleAdapterState adapter = BleAdapterState.poweredOn;
+
+  /// When set, [start] throws this, as the platform does with the radio off.
+  Object? startFailure;
 
   void emit(BleEvent event) => _events.add(event);
 
@@ -92,7 +98,7 @@ class FakeBlePlatformApi implements BlePlatformApi {
   @override
   Future<BleAdapterState> adapterState() async {
     _maybeThrow();
-    return BleAdapterState.poweredOn;
+    return adapter;
   }
 
   @override
@@ -105,6 +111,8 @@ class FakeBlePlatformApi implements BlePlatformApi {
   Future<void> start(BleConfig config) async {
     _maybeThrow();
     startCalls++;
+    final failure = startFailure;
+    if (failure != null) throw failure;
     lastConfig = config;
   }
 

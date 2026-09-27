@@ -1,4 +1,4 @@
-# `ble_mesh` cryptography
+# `ble_mesh_chat` cryptography
 
 > **Experimental.** This suite has not had an external review. Do not rely on
 > it to protect anyone whose safety depends on the result. The API and the wire
@@ -260,6 +260,56 @@ AEAD are in [TEST_VECTORS.md](TEST_VECTORS.md). They are generated from fixed
 inputs by `tool/generate_crypto_vectors.dart` and still require independent
 verification during the external review.
 
+## Nostr relay transport
+
+`NostrChatTransport` adds no new message cryptography. It carries the same
+wire-v3 packet, signed by the sender and sealed for the recipient when it is
+a direct message, as base64 content inside a NIP-01 event (kind 30078 by
+default).
+
+- **Two signatures, two jobs.** The outer BIP-340 signature exists because
+  relays require it. It proves only that the event was not modified in
+  transit. The Ed25519 packet signature still proves the sender, and the
+  facade verifies it before deduplication, as it does for BLE.
+- **Per-packet envelope keys.** Each packet is wrapped with a freshly
+  generated secp256k1 key, so relays cannot link a sender's events through
+  the event `pubkey`. A host may pass a fixed `publisherKey` for relays that
+  allow-list by pubkey, at the cost of that linkability.
+- **BIP-340 implementation.** Signing and verification use the `bip340`
+  package, which is pure Dart and not constant-time. With single-use
+  envelope keys, a timing leak does not expose a long-lived secret. The
+  suite checks BIP-340 vector 0 against the published value.
+- **Only signed, originated, direct packets.** The transport publishes a
+  packet only when this device created it, it is addressed to a peer (`p:`),
+  and it is signed. Inbound events must pass the event signature, kind, route
+  tag, and size checks. Their packet id must match the `d` tag, and the packet
+  must be signed and addressed to this device. Anything else is reported on
+  `errors` and dropped.
+- **Bridging needs signed consent.** The facade relays a packet only on the
+  transport it arrived on. The Nostr transport republishes another
+  device's packet only when that packet carries its origin's signed
+  *bridgeable* flag and this device is an active gateway. See
+  [BRIDGE.md](BRIDGE.md).
+
+What relays can see:
+
+| Visible to relays | How |
+| --- | --- |
+| That the recipient receives traffic | `y` tag = SHA-256 of `p:<peer id>`; anyone who knows a peer id can compute it |
+| Packet id, timing, expiry, size | `d` tag, `created_at`, NIP-40 `expiration`, content length |
+| Sender peer id and public keys | inside the packet header, which is signed but not encrypted |
+| Which packet an ACK confirms | ACK payloads are signed but readable |
+| Client IP address | every WebSocket connection |
+
+Relays cannot read direct-message text or forge a packet. A relay can drop,
+delay, or withhold events. Delivery state reflects this: a relay `OK` is only
+`sent`, and `delivered` still requires the recipient's signed
+acknowledgement. Online first contact still uses trust on first use:
+`ChatPublicKeys.toContactCode()` gives a shareable code, and whoever supplies
+that code decides whom you trust. Anyone who knows a peer id can send it
+signed traffic, so rate limiting and blocking remain the host's
+responsibility.
+
 ## Upgrade compatibility
 
 This revision uses **wire version 3** and signing/AAD domains `bmp2`/`bma2`.
@@ -269,6 +319,11 @@ history and seen IDs are preserved. Queued older-format packets are skipped
 and marked failed unless already delivered; users must resend their contents.
 Old signatures cannot safely be migrated by a relay or store.
 
+## Automated attacks
+
+Flood limits, hidden-text handling, safety numbers, and fuzzing are covered
+in [THREAT_MODEL.md](THREAT_MODEL.md).
+
 ## What is not done
 
 - No external review. This is the blocking item.
@@ -277,5 +332,8 @@ Old signatures cannot safely be migrated by a relay or store.
 - The example shows an agreement-key comparison prompt, but it does not
   provide contact verification or a managed recovery flow.
 - No post-compromise security; a stolen agreement key opens past traffic.
-- Generated suite vectors need independent confirmation. Automated and
-  physical acceptance tests remain with the user.
+- Generated suite vectors need independent confirmation. The automated suite
+  passes; testing on physical devices is still in progress.
+- Nostr metadata protection is limited to per-packet envelope keys and hashed
+  route tags. There is no sender sealing, padding, or cover traffic, and
+  relays see the recipient route and client IP addresses.

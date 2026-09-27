@@ -9,6 +9,7 @@ import 'trust_store.dart';
 
 /// Result of admitting an inbound packet.
 class VerifiedPacket {
+  /// Creates a result; produced by [PacketSecurity.admit].
   const VerifiedPacket({
     required this.packet,
     required this.trust,
@@ -17,7 +18,15 @@ class VerifiedPacket {
 
   /// The packet with its payload opened when it was sealed for us.
   final ChatPacket packet;
+
+  /// How the sender's keys compared with the pinned record. Never
+  /// [PeerTrust.changed]; that case throws [PeerKeyChangedException].
   final PeerTrust trust;
+
+  /// Keys the signature was verified against.
+  ///
+  /// Non-null when produced by [PacketSecurity.admit]. They prove key
+  /// ownership, not a person's real-world identity.
   final ChatPublicKeys? senderKeys;
 }
 
@@ -27,16 +36,26 @@ class VerifiedPacket {
 /// deduplication, relaying, and display all run on packets whose sender has
 /// been proven, so a forged packet cannot occupy a packet id or be forwarded.
 class PacketSecurity {
+  /// Creates a security layer for [identity].
+  ///
+  /// Uses an empty in-memory [TrustStore] when [trustStore] is omitted, so
+  /// pins are lost unless the host persists them.
   PacketSecurity({
     required this.identity,
     TrustStore? trustStore,
     this.cipher = const SealedMessageCipher(),
   }) : trustStore = trustStore ?? TrustStore();
 
+  /// This device's key pair; signs outbound packets and opens sealed ones.
   final ChatKeyPair identity;
+
+  /// Pinned peer keys consulted and updated by [admit].
   final TrustStore trustStore;
+
+  /// Cipher used for sealed direct payloads.
   final MessageCipher cipher;
 
+  /// Suite identifier of [cipher].
   String get suiteId => cipher.suiteId;
 
   /// Seals [packet] for [recipient] when possible, then signs it.
@@ -142,6 +161,7 @@ class PacketSecurity {
         payload: clear,
         signature: packet.signature,
         senderKeys: packet.senderKeys,
+        bridgeable: packet.bridgeable,
       );
     }
     return VerifiedPacket(packet: opened, trust: trust, senderKeys: keys);

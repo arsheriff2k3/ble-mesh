@@ -26,6 +26,10 @@ import 'packet_codec.dart';
 /// and the file is trimmed back to the last good record on the next write.
 /// Everything before the tear survives.
 class FileMessageStore implements MessageStore {
+  /// Creates a store over [file]. Nothing is read or written until [open].
+  ///
+  /// [clock] defaults to [DateTime.now] and decides expiry; it exists for
+  /// tests.
   FileMessageStore({
     required this.file,
     this.maximumQueuedPackets = 1024,
@@ -65,11 +69,28 @@ class FileMessageStore implements MessageStore {
   static const _recordState = 0x04;
   static const _recordSeen = 0x05;
 
+  /// The log file. Compaction also writes a sibling `<path>.compacting`.
   final File file;
+
+  /// Most unexpired packets [enqueue] accepts before throwing
+  /// [MessageStoreFullException]. Defaults to 1024.
   final int maximumQueuedPackets;
+
+  /// Most messages retained; saving beyond this evicts the oldest message
+  /// and its state. Defaults to 4096.
   final int maximumMessages;
+
+  /// Most unexpired packet ids [rememberSeen] retains before throwing
+  /// [SeenPacketQuotaException]. Defaults to 65536.
   final int maximumSeenPackets;
+
+  /// Estimated bytes of superseded records that must accumulate, and make up
+  /// at least a third of the file, before the log is rewritten. [open] also
+  /// rewrites a file larger than four times this. Defaults to 512 KiB.
   final int compactionThresholdBytes;
+
+  /// Encodes queued packets in the log. Its [ChatPacketCodec.maxPacketSize]
+  /// bounds the packets [enqueue] accepts.
   final ChatPacketCodec codec;
   final DateTime Function() _clock;
 

@@ -4,23 +4,10 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 
 import 'chat_keys.dart';
+import 'identity_store_base.dart';
 import 'trust_store.dart';
 
-/// Where a device's long-term private keys live.
-abstract interface class IdentityStore {
-  /// Loads the stored identity, or null on a device that has never had one.
-  Future<ChatKeyPair?> load();
-
-  /// Persists [keys] and returns them.
-  Future<void> save(ChatKeyPair keys);
-
-  /// Destroys the identity. The next [load] returns null.
-  Future<void> erase();
-
-  /// Loads and persists pinned peer keys.
-  Future<TrustStore> loadTrust();
-  Future<void> saveTrust(TrustStore store);
-}
+export 'identity_store_base.dart';
 
 /// Keeps private keys in the platform keystore.
 ///
@@ -28,6 +15,7 @@ abstract interface class IdentityStore {
 /// Keychain. Falls back to [FileIdentityStore] on other platforms. Storage
 /// errors on supported platforms propagate without replacing the identity.
 class PlatformIdentityStore implements IdentityStore {
+  /// Creates a store that uses [fallback] where no keystore is available.
   PlatformIdentityStore({required this.fallback});
 
   static const _channel = MethodChannel('dev.blemesh.ble_mesh/keys');
@@ -118,8 +106,11 @@ class PlatformIdentityStore implements IdentityStore {
 /// bytes. It exists so desktop and test runs work, and as the fallback when a
 /// platform offers no keystore.
 class FileIdentityStore implements IdentityStore {
+  /// Creates a store that writes into [directory], creating it on save.
   FileIdentityStore({required this.directory});
 
+  /// Directory holding `identity.keys` (base64 private seeds in JSON) and
+  /// `trusted.peers`. The seeds are not encrypted.
   final Directory directory;
   Future<void> _writes = Future<void>.value();
 
@@ -201,13 +192,4 @@ class FileIdentityStore implements IdentityStore {
       ),
     );
   }
-}
-
-/// Loads the stored identity or creates and persists a new one.
-Future<ChatKeyPair> loadOrCreateIdentity(IdentityStore store) async {
-  final existing = await store.load();
-  if (existing != null) return existing;
-  final created = await ChatKeyPair.generate();
-  await store.save(created);
-  return created;
 }

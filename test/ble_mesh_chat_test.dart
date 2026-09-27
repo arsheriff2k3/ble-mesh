@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:ble_mesh/ble_mesh.dart';
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'test_chat_transport.dart';
@@ -149,4 +149,7 @@ void main() {
   });
 }
 
-BleMeshChat createChat() => BleMeshChat(maximumRelayJitter: Duration.zero);
+BleMeshChat createChat() => BleMeshChat(
+  maximumRelayJitter: Duration.zero,
+  minimumRelaySpacing: Duration.zero,
+);

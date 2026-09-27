@@ -359,7 +359,7 @@ extension CentralController: CBCentralManagerDelegate {
   }
 
   /// Background relaunch hands the peripherals back rather than rediscovering
-  /// them. Full relaunch support is a later phase; re-adopting what the system
+  /// them. Full relaunch support is not implemented; re-adopting what the system
   /// gives us is cheap and stops the links from being orphaned.
   func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
     guard let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]

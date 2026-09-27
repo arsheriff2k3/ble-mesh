@@ -4,7 +4,11 @@ import 'dart:typed_data';
 import 'chat_models.dart';
 import 'crypto/chat_keys.dart';
 
+/// Thrown when a [ChatPacket] cannot be encoded, or bytes do not decode to a
+/// valid packet.
 class ChatPacketFormatException implements FormatException {
+  /// Creates an exception describing the fault in [message], optionally with
+  /// the offending [source] and the [offset] within it.
   const ChatPacketFormatException(this.message, [this.source, this.offset]);
 
   @override
@@ -20,6 +24,7 @@ class ChatPacketFormatException implements FormatException {
 
 /// Deterministic binary codec for mesh packets.
 class ChatPacketCodec {
+  /// Creates a codec that refuses packets larger than [maxPacketSize].
   const ChatPacketCodec({this.maxPacketSize = 64 * 1024});
 
   static const _magic = 0x424d;
@@ -31,8 +36,19 @@ class ChatPacketCodec {
   static const _flagSigned = 0x01;
   static const _flagSealed = 0x02;
 
+  /// Bit 2 marks the origin's consent to cross gateways.
+  static const _flagBridgeable = 0x04;
+
+  /// Largest encoded packet accepted by [encode] and [decode], in bytes.
+  /// Defaults to 64 KiB.
   final int maxPacketSize;
 
+  /// Encodes [packet] in the version 3 wire format.
+  ///
+  /// Throws [ChatPacketFormatException] when the UTF-8 sender or destination
+  /// exceeds 65535 bytes, when [ChatPacket.signature] is set without
+  /// [ChatPacket.senderKeys], or when the result would exceed
+  /// [maxPacketSize].
   Uint8List encode(ChatPacket packet) {
     final sender = utf8.encode(packet.senderId);
     final destination = utf8.encode(packet.destination);
@@ -68,7 +84,8 @@ class ChatPacketCodec {
     data.setUint8(
       offset++,
       (signature == null ? 0 : _flagSigned) |
-          (packet.isSealed ? _flagSealed : 0),
+          (packet.isSealed ? _flagSealed : 0) |
+          (packet.bridgeable ? _flagBridgeable : 0),
     );
     data.setInt64(offset, packet.createdAt.millisecondsSinceEpoch);
     offset += 8;
@@ -95,6 +112,13 @@ class ChatPacketCodec {
     return bytes;
   }
 
+  /// Decodes a packet produced by [encode].
+  ///
+  /// Validates structure only; signatures are not verified here. Throws
+  /// [ChatPacketFormatException] for truncated or oversized input, a wrong
+  /// magic or version, an unknown type or flag, a zero TTL, a timestamp
+  /// outside the [DateTime] range, inconsistent lengths, or invalid UTF-8 in
+  /// the sender or destination.
   ChatPacket decode(Uint8List bytes) {
     if (bytes.length < _fixedLength) {
       throw const ChatPacketFormatException('truncated packet');
@@ -120,7 +144,8 @@ class ChatPacketCodec {
     final flags = data.getUint8(offset++);
     final signed = flags & _flagSigned != 0;
     final sealed = flags & _flagSealed != 0;
-    if (flags & ~(_flagSigned | _flagSealed) != 0) {
+    final bridgeable = flags & _flagBridgeable != 0;
+    if (flags & ~(_flagSigned | _flagSealed | _flagBridgeable) != 0) {
       throw const ChatPacketFormatException('unknown packet flags');
     }
     final createdAtMs = data.getInt64(offset);
@@ -185,6 +210,7 @@ class ChatPacketCodec {
         signature: signature,
         senderKeys: senderKeys,
         isSealed: sealed,
+        bridgeable: bridgeable,
       );
     } on FormatException catch (error) {
       throw ChatPacketFormatException('invalid UTF-8 metadata: $error');

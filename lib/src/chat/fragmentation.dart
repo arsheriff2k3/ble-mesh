@@ -1,6 +1,9 @@
 import 'dart:typed_data';
 
+/// Thrown when a fragment is malformed or inconsistent with its siblings, or
+/// when a packet cannot be split into a valid fragment sequence.
 class FragmentFormatException implements FormatException {
+  /// Creates an exception describing the fault in [message].
   const FragmentFormatException(this.message);
 
   @override
@@ -14,13 +17,29 @@ class FragmentFormatException implements FormatException {
   String toString() => 'FragmentFormatException: $message';
 }
 
+/// Splits an encoded packet into frames small enough for a BLE link.
+///
+/// Each frame carries a [headerLength]-byte header: magic `0xb17e` (u16),
+/// version (u8), a reserved byte, a group id taken from the first four bytes
+/// of the packet id (u32), the fragment index (u16), and the fragment count
+/// (u16), all big-endian. [PacketReassembler] reverses the split.
 class PacketFragmenter {
+  /// Creates a stateless fragmenter.
   const PacketFragmenter();
 
+  /// Bytes of header prepended to every frame.
   static const headerLength = 12;
   static const _magic = 0xb17e;
   static const _version = 1;
 
+  /// Splits [packet] into frames of at most [maxFrameSize] bytes, in index
+  /// order.
+  ///
+  /// Every frame except possibly the last carries
+  /// `maxFrameSize - headerLength` payload bytes. Throws [ArgumentError] when
+  /// [packetId] is not 16 bytes or [maxFrameSize] does not exceed
+  /// [headerLength], and [FragmentFormatException] when [packet] is empty or
+  /// would need more than 65535 fragments.
   List<Uint8List> fragment(
     Uint8List packetId,
     Uint8List packet,
@@ -57,7 +76,15 @@ class PacketFragmenter {
   }
 }
 
+/// Rebuilds packets from frames produced by [PacketFragmenter].
+///
+/// Partial packets are tracked per route and fragment group, so frames from
+/// different links never mix. Memory is bounded by [maxAssemblies] and
+/// [maxPacketSize], and a partial packet that stops receiving frames is
+/// dropped after [timeout].
 class PacketReassembler {
+  /// Creates a reassembler. [clock] defaults to [DateTime.now] and exists for
+  /// tests.
   PacketReassembler({
     this.maxPacketSize = 64 * 1024,
     this.maxAssemblies = 32,
@@ -65,12 +92,27 @@ class PacketReassembler {
     DateTime Function()? clock,
   }) : _clock = clock ?? DateTime.now;
 
+  /// Largest reassembled packet accepted, in bytes. Defaults to 64 KiB.
   final int maxPacketSize;
+
+  /// Most partial packets held at once. Defaults to 32; when full, starting
+  /// a new one evicts the partial packet updated least recently.
   final int maxAssemblies;
+
+  /// How long a partial packet survives without a new frame. Defaults to
+  /// 20 seconds.
   final Duration timeout;
   final DateTime Function() _clock;
   final Map<String, _Assembly> _assemblies = {};
 
+  /// Adds [frame] received on [routeId] and returns the whole packet once its
+  /// last missing fragment arrives, or null while fragments are outstanding.
+  ///
+  /// Fragments may arrive in any order; a repeated index keeps the first
+  /// copy. Throws [FragmentFormatException] for a truncated frame, an unknown
+  /// magic or version, an index outside the declared count, a count that
+  /// differs from earlier fragments of the same group, or a packet that
+  /// exceeds [maxPacketSize]. The last two also discard the partial packet.
   Uint8List? add(String routeId, Uint8List frame) {
     _expire();
     if (frame.length < PacketFragmenter.headerLength) {
@@ -128,6 +170,8 @@ class PacketReassembler {
     return result;
   }
 
+  /// Drops every partial packet received on [routeId], for example when its
+  /// link goes down.
   void discardRoute(String routeId) {
     _assemblies.removeWhere((key, _) => key.startsWith('$routeId:'));
   }

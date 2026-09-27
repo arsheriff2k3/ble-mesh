@@ -17,7 +17,7 @@ import 'package:pigeon/pigeon.dart';
     kotlinOut:
         'android/src/main/kotlin/dev/blemesh/ble_mesh/BleApi.g.kt',
     kotlinOptions: KotlinOptions(package: 'dev.blemesh.ble_mesh'),
-    swiftOut: 'darwin/ble_mesh/Sources/ble_mesh/BleApi.g.swift',
+    swiftOut: 'darwin/ble_mesh_chat/Sources/ble_mesh_chat/BleApi.g.swift',
     swiftOptions: SwiftOptions(),
     dartPackageName: 'ble_mesh',
   ),

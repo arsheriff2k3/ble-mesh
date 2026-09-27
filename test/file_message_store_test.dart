@@ -2,8 +2,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:ble_mesh/ble_mesh.dart';
-import 'package:ble_mesh/file_store.dart';
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
+import 'package:ble_mesh_chat/file_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

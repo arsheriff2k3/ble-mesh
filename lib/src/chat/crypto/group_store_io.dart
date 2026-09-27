@@ -7,10 +7,16 @@ import 'group_crypto.dart';
 
 /// Group keys use the same native vault as the identity on Android and Apple.
 class PlatformGroupStore implements GroupStore {
+  /// Creates a store that uses [fallback] only off Android, iOS, and macOS.
+  ///
+  /// On those platforms a missing or unavailable vault throws instead of
+  /// falling back to plaintext.
   PlatformGroupStore({required this.fallback});
 
   static const _channel = MethodChannel('dev.blemesh.ble_mesh/keys');
   static const _storageKey = 'ble_mesh.groups.v1';
+
+  /// Plaintext store used on platforms without the native vault.
   final FileGroupStore fallback;
 
   @override
@@ -69,7 +75,11 @@ class PlatformGroupStore implements GroupStore {
 
 /// Explicit plaintext fallback for unsupported platforms and local development.
 class FileGroupStore implements GroupStore {
+  /// Creates a store backed by [file].
   FileGroupStore(this.file);
+
+  /// JSON file holding group keys in plaintext. Writes go through a
+  /// temporary file and rename.
   final File file;
   Future<void> _writes = Future<void>.value();
 

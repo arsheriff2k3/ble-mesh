@@ -1,13 +1,24 @@
-# ble_mesh
+# ble_mesh_chat
 
-Flutter plugin for transport-agnostic, offline-first mesh chat. The current
-`0.1.0` preview provides the dual-role BLE byte transport plus a Dart chat
-layer with packet routing, fragmentation, deduplication, acknowledgements, and
-an in-memory retry queue. Durable storage, encryption, and Nostr come later.
+Flutter plugin for offline-first chat. Phones talk directly over a
+Bluetooth Low Energy mesh when there is no network, reach contacts online
+through Nostr relays when there is, and can bridge between the two through a
+consenting gateway phone.
 
-See the [chat plugin implementation plan](docs/CHAT_PLUGIN_PLAN.md) for the
-target API, architecture, delivery phases, and physical-device acceptance
-criteria.
+- **BLE mesh:** a dual-role (central and peripheral) transport, with TTL
+  flooding, deduplication, fragmentation, and acknowledgements.
+- **Security:** signed packets, key-derived peer ids, sealed direct
+  messages, encrypted groups, trust on first use, and safety numbers. All of
+  it is **experimental and not yet externally reviewed**; see
+  [doc/LIMITATIONS.md](doc/LIMITATIONS.md).
+- **Durability:** a crash-tolerant message store, retries until the
+  recipient acknowledges, and replay protection that survives restarts.
+- **Online delivery:** encrypted direct messages over one or more Nostr
+  relays.
+- **Bridging:** opt-in gateways that carry consenting traffic between BLE and
+  Nostr.
+- **Abuse resistance:** rate budgets, contacts-only online delivery, a
+  hidden-text sanitizer, and fuzzed parsers.
 
 Dual-role (central **and** peripheral) Bluetooth Low Energy byte transport for
 Flutter — the missing layer under a BLE mesh.
@@ -19,7 +30,7 @@ both at once, which is why this plugin exists: `flutter_blue_plus` and
 cannot carry data both ways. Without the dual role there is no mesh, only a
 star.
 
-Use the included Phase 1 chat protocol, or build your own protocol directly on
+Use the included chat layer, or build your own protocol directly on
 the byte transport for telemetry, signed reports, or other offline data.
 
 Android, iOS, and macOS. Web, Windows, and Linux degrade to a documented no-op
@@ -48,33 +59,70 @@ your protocol layer's job, because only it has seen the peer's announce.
 
 ```yaml
 dependencies:
-  ble_mesh: ^0.1.0
+  ble_mesh_chat: ^0.1.0
 ```
 
 ## Usage
 
-### Phase 1 chat API
+### Chat quick start
 
 ```dart
-final identity = ChatIdentity(peerId: 'device-a', displayName: 'Alice');
-final chat = BleMeshChat();
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
+import 'package:ble_mesh_chat/file_store.dart';
+import 'package:path_provider/path_provider.dart';
 
-await chat.initialize(
-  identity: identity,
-  transports: [BleChatTransport(identity: identity)],
+final dir = await getApplicationSupportDirectory();
+
+// A durable identity: private keys go to Android Keystore / Apple Keychain.
+final identityStore = PlatformIdentityStore(
+  fallback: FileIdentityStore(directory: dir),
 );
+final keys = await loadOrCreateIdentity(identityStore);
+final security = PacketSecurity(
+  identity: keys,
+  trustStore: await identityStore.loadTrust(),
+);
+final me = ChatIdentity(peerId: keys.peerId, displayName: 'Alice');
 
-chat.messages.listen((message) => print('${message.senderId}: ${message.text}'));
+final ble = BleMeshTransport();
+await ble.requestPermissions();
+
+final chat = BleMeshChat(
+  security: security,
+  store: FileMessageStore.at('${dir.path}/chat.log'),
+);
+chat.messages.listen((message) {
+  // Remote text is untrusted input; strip invisible characters for display.
+  print(UntrustedText.stripHidden(message.text));
+});
 chat.messageStates.listen((change) => print(change.state.name));
 
-await chat.send(conversationId: 'general', text: 'Hello mesh!');
-await chat.sendDirect(peerId: 'device-b', text: 'Private delivery');
+await chat.initialize(
+  identity: me,
+  transports: [
+    BleChatTransport(identity: me, transport: ble, security: security),
+    // Optional: online delivery to contacts through Nostr relays.
+    NostrChatTransport(identity: me, relays: const ['wss://relay.example.com']),
+  ],
+);
+
+await chat.send(conversationId: 'general', text: 'Hello mesh!'); // signed, readable
+await chat.sendDirect(peerId: bobPeerId, text: 'Private');      // sealed
 ```
 
-The Phase 1 protocol provides bounded binary packets, fragmentation, controlled
-TTL flooding, duplicate suppression, acknowledgements, and an in-memory retry
-queue. It is **not encrypted yet**. Do not use it for sensitive messages;
-reviewed identity and encryption are Phase 3.
+A few things to know:
+
+- **Direct messages need the recipient's key.** It is learned from a BLE
+  meeting, or pinned from a contact code (`ChatPublicKeys.toContactCode()`
+  and `fromContactCode()`). Saving pinned keys with
+  `identityStore.saveTrust` is the host's job; the example shows how.
+- **Delivery states.** `sent` means a route accepted the packet;
+  `delivered` means the recipient's signed acknowledgement arrived.
+- **Online contacts only.** Nostr accepts messages from contacts only by
+  default (`contactsOnlyTransports`).
+- **Bridging** is off unless the sender sets `bridgeConsent` and a gateway
+  sets a `BridgePolicy`. See [doc/BRIDGE.md](doc/BRIDGE.md).
+- `example/` is a complete harness covering all of the above.
 
 ### Low-level byte transport
 
@@ -142,6 +190,7 @@ Permissions and the foreground service are declared in the plugin's manifest
 and merge automatically. The host app still needs:
 
 - `minSdk 24` or higher.
+- `android.permission.INTERNET` if you use `NostrChatTransport`.
 - On Android 13+, `POST_NOTIFICATIONS` if you want the mesh's foreground-service
   notification to actually appear. The service runs either way, but a mesh that
   runs invisibly is not something to ship.
@@ -162,13 +211,15 @@ may derive location from scan results.
 </array>
 ```
 
-If your protocol layer adds its own encryption, answer export compliance
-(`ITSAppUsesNonExemptEncryption`) accordingly at submission.
+The chat layer uses encryption (Ed25519, X25519, XChaCha20-Poly1305), so
+answer export compliance (`ITSAppUsesNonExemptEncryption`) accordingly at
+submission.
 
 ### macOS
 
 Add `com.apple.security.device.bluetooth` to both entitlements files. Without
-it a sandboxed app fails silently, with no error and no radio.
+it a sandboxed app fails silently, with no error and no radio. Nostr relays
+also need `com.apple.security.network.client`.
 
 ## Platform behaviour worth knowing
 
@@ -185,29 +236,18 @@ That last row is a product constraint, not a bug: a cluster needs at least one
 foregrounded device. Your UI must say so rather than implying a mesh that is
 not there.
 
-## Chat protocol implementation
+## Documentation
 
-The transport gives you links and frames. The Phase 1 Dart chat layer now adds:
-
-1. **A packet codec** — a bounded binary header with version, type, packet ID,
-   TTL, sender, destination, timestamps, and payload length.
-2. **Flood routing** with TTL decay, a dedupe cache keyed on the random 128-bit
-   packet ID, and jittered rebroadcast. Without dedupe the mesh melts into a
-   broadcast storm.
-3. **Fragmentation** to `minFrameSize`, with reassembly timeouts and a size cap.
-4. **Duplicate-link suppression** — two devices usually connect to each other
-   twice. Once announces have identified the peers, the lower peer ID keeps its
-   outbound link and the higher one drops its own.
-5. **Peer announcements and acknowledgements** — enough to collapse duplicate
-   links and distinguish `sent` from destination-confirmed `delivered`.
-
-Identity authentication and payload encryption intentionally remain Phase 3.
-They must use a reviewed protocol with published test vectors.
-
-These layers are part of the high-level `ble_mesh` Flutter plugin API, not
-application-specific code. The existing byte API remains available for
-advanced consumers. See the
-[chat plugin implementation plan](docs/CHAT_PLUGIN_PLAN.md).
+| Document | Covers |
+| --- | --- |
+| [LIMITATIONS.md](doc/LIMITATIONS.md) | Every known security, platform, and resource limit |
+| [CRYPTO.md](doc/CRYPTO.md) | Cryptographic design, trust model, and Nostr metadata |
+| [BRIDGE.md](doc/BRIDGE.md) | Gateways: consent, loops, metadata, data use, battery |
+| [THREAT_MODEL.md](doc/THREAT_MODEL.md) | Floods, fuzzing, hidden-text injection, impersonation, and the defences against them |
+| [API_STABILITY.md](doc/API_STABILITY.md) | Stability tiers, wire and storage compatibility, migration |
+| [INTEGRATION_TESTING.md](doc/INTEGRATION_TESTING.md) | Testing recipes, from in-memory to on-device |
+| [PERFORMANCE.md](doc/PERFORMANCE.md) | Measurements and device benchmark recipes |
+| [TEST_VECTORS.md](doc/TEST_VECTORS.md) | Deterministic protocol vectors |
 
 ## Development
 
@@ -247,7 +287,7 @@ exactly that reason.
 ```
 pigeons/ble_api.dart      channel contract (source of truth)
 lib/
-  ble_mesh.dart           public exports
+  ble_mesh_chat.dart      public exports
   src/
     ble_mesh_transport.dart   the facade: streams, link bookkeeping, broadcast
     platform_api.dart         seam that makes the facade testable
@@ -262,23 +302,28 @@ android/src/main/kotlin/dev/blemesh/ble_mesh/
   LinkRegistry.kt           live links
   BleEventBus.kt            the single ordered event channel
   MeshForegroundService.kt  keeps the process alive with the mesh on
-darwin/ble_mesh/Sources/ble_mesh/
+darwin/ble_mesh_chat/Sources/ble_mesh_chat/
   BleMeshPlugin.swift, BleController.swift,
   CentralController.swift, PeripheralController.swift,
   LinkRegistry.swift, BleEventBus.swift, BleTransportError.swift
-example/                  two-device echo harness
+  chat/                     packets, routing, stores, Nostr, bridging
+    crypto/                 keys, sealing, trust, groups (experimental)
+    nostr/                  NIP-01 events, sockets, vendored BIP-340
+lib/file_store.dart       dart:io stores (message log, identity, groups)
+benchmark/                performance measurements
+example/                  mesh chat and diagnostics harness
+example/integration_test/ on-device smoke suite
 ```
 
 iOS and macOS share one Swift source tree via `sharedDarwinSource: true`.
 
 ## Status
 
-Android, iOS, and macOS all build and link; the harness runs on an iOS
-simulator with the plugin registered and answering; the Dart side is unit
-tested. But **nothing here has moved a byte over a real radio yet** — and the
-iOS simulator has no Bluetooth radio, so it cannot test the mesh at all. See
-the implementation plan for the physical-device gates that must pass before
-you depend on it.
+Pre-release. The example builds for Android, iOS, and macOS, and the test
+suite covers the protocol, storage, transports, abuse handling, and fuzzing.
+Broader testing on physical devices is ongoing, and the cryptography has not
+been externally reviewed. Read [doc/LIMITATIONS.md](doc/LIMITATIONS.md)
+before depending on it.
 
 ## License
 

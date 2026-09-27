@@ -4,6 +4,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'ble_chat_transport.dart';
+import 'bridge_policy.dart';
 import 'chat_models.dart';
 import 'chat_transport.dart';
 import 'crypto/chat_keys.dart';
@@ -11,10 +12,21 @@ import 'crypto/group_crypto.dart';
 import 'crypto/message_cipher.dart';
 import 'crypto/packet_security.dart';
 import 'crypto/trust_store.dart';
+import 'inbound_policy.dart';
 import 'message_store.dart';
 
 /// High-level offline mesh chat facade.
 class BleMeshChat {
+  /// Creates a chat facade. Nothing starts until [initialize].
+  ///
+  /// [store] defaults to an [InMemoryMessageStore] and [groupStore] to an
+  /// [InMemoryGroupStore], so history and group keys are lost on exit unless
+  /// durable stores are passed. [perSenderLimit] budgets each authenticated
+  /// sender and [perRouteLimit] each arrival route (a BLE link or a relay).
+  /// The bridge arguments are initial values for the getters of the same
+  /// name; both default to off. [clock] and [random] exist for tests;
+  /// [random] defaults to [Random.secure]. [messageLifetime] must not exceed
+  /// [maximumPacketLifetime].
   BleMeshChat({
     this.security,
     GroupStore? groupStore,
@@ -30,7 +42,31 @@ class BleMeshChat {
     this.retryBackoff = const Duration(seconds: 2),
     this.maximumRetryBackoff = const Duration(minutes: 2),
     this.retrySpacing = const Duration(milliseconds: 50),
-  }) : _store = store ?? InMemoryMessageStore(),
+    this.redundantDelivery = false,
+    this.maximumPacketLifetime = const Duration(hours: 24),
+    this.maximumClockSkew = const Duration(minutes: 10),
+    InboundRateLimit perSenderLimit = const InboundRateLimit(
+      burst: 100,
+      perSecond: 2,
+    ),
+    InboundRateLimit perRouteLimit = const InboundRateLimit(
+      burst: 400,
+      perSecond: 20,
+    ),
+    this.contactsOnlyTransports = const {'nostr'},
+    bool bridgeConsent = false,
+    BridgePolicy? bridgePolicy,
+    this.bridgeRegistrationInterval = const Duration(minutes: 4),
+  }) : assert(messageLifetime <= maximumPacketLifetime),
+       // Mutable after construction, so not initializing formals.
+       // ignore: prefer_initializing_formals
+       _bridgeConsent = bridgeConsent,
+       // ignore: prefer_initializing_formals
+       _bridgePolicy = bridgePolicy,
+       _bridgeBucket = _bridgeBucketFor(bridgePolicy, clock),
+       _senderBuckets = TokenBuckets(perSenderLimit, clock: clock),
+       _routeBuckets = TokenBuckets(perRouteLimit, clock: clock),
+       _store = store ?? InMemoryMessageStore(),
        _groupStore = groupStore ?? InMemoryGroupStore(),
        _clock = clock ?? DateTime.now,
        _random = random ?? Random.secure(),
@@ -47,10 +83,28 @@ class BleMeshChat {
   final DedupeCache _dedupe;
   final DateTime Function() _clock;
   final Random _random;
+
+  /// Hop budget given to packets this device creates. Each relay decrements
+  /// it, and a packet whose TTL is 1 is not relayed further. Defaults to 5.
   final int defaultTtl;
+
+  /// How long a packet this device creates stays deliverable. Queued
+  /// messages still undelivered after this are marked
+  /// [MessageState.failed], and peers drop them. Defaults to one hour.
   final Duration messageLifetime;
+
+  /// Upper bound of the random delay added before relaying a packet, so
+  /// neighbours that heard the same packet do not all transmit at once.
+  /// [Duration.zero] disables it. Defaults to 250 ms.
   final Duration maximumRelayJitter;
+
+  /// Least time between the starts of two consecutive relays. Defaults to
+  /// 50 ms.
   final Duration minimumRelaySpacing;
+
+  /// Most inbound packets and relay replays waiting to be processed. Packets
+  /// arriving while the queue is full are dropped without an error. Defaults
+  /// to 256.
   final int maximumPendingInbound;
   DateTime? _lastRelayAt;
   Future<void> _inboundWork = Future<void>.value();
@@ -64,6 +118,53 @@ class BleMeshChat {
 
   /// Pause between packets while draining a backlog.
   final Duration retrySpacing;
+
+  /// Sends direct packets over every available transport at once instead of
+  /// preferring one on which the recipient is currently known.
+  final bool redundantDelivery;
+
+  /// Longest `expiresAt - createdAt` accepted from another device.
+  ///
+  /// Packet ids are retained for replay protection until the packet
+  /// expires. Without a cap, signed packets claiming to expire in decades
+  /// fill that store permanently and every new packet is refused.
+  final Duration maximumPacketLifetime;
+
+  /// How far in the future another device's `createdAt` may be.
+  final Duration maximumClockSkew;
+
+  /// Transports that accept packets only from senders whose key is already
+  /// pinned. Nostr is included by default: anyone on the internet who learns
+  /// a peer id can reach it there, and fresh identities cost nothing.
+  final Set<String> contactsOnlyTransports;
+
+  /// Budgets per authenticated sender, and per arrival route (a BLE link or
+  /// a relay). The route budget also bounds swarms of fresh identities.
+  final TokenBuckets _senderBuckets;
+  final TokenBuckets _routeBuckets;
+  final Map<String, DateTime> _lastLimitReport = {};
+
+  /// How often a consenting offline device asks nearby gateways to receive
+  /// its online traffic. Each registration lasts [_registrationLifetime].
+  final Duration bridgeRegistrationInterval;
+  static const _registrationLifetime = Duration(minutes: 10);
+  static const _maximumRegistrationLifetime = Duration(minutes: 15);
+
+  bool _bridgeConsent;
+  BridgePolicy? _bridgePolicy;
+  NetworkConditions? _network;
+  TokenBuckets _bridgeBucket;
+
+  /// Registered offline devices, by peer id, and when each registration ends.
+  final Map<String, DateTime> _bridgeRoutes = {};
+
+  /// Packets this device has carried across, so each crosses here once.
+  final Map<String, DateTime> _bridgedPacketIds = {};
+  int _bridgedPacketCount = 0;
+  DateTime? _lastRegistrationAt;
+  Timer? _bridgeTimer;
+  BridgeStatus? _lastBridgeStatus;
+  final _bridgeStatus = StreamController<BridgeStatus>.broadcast();
 
   final _messages = StreamController<ChatMessage>.broadcast();
   final _peers = StreamController<List<ChatPeer>>.broadcast();
@@ -83,6 +184,9 @@ class BleMeshChat {
   final Map<String, ReceivedChatPacket> _pendingGroupPackets = {};
   final Map<String, ReceivedChatPacket> _relayCache = {};
 
+  /// Direct packets a route accepted but the recipient has not acknowledged.
+  final Set<String> _unacknowledgedPacketIds = {};
+
   /// Consecutive failed flushes, used to space out retries.
   int _flushFailures = 0;
   Timer? _retryTimer;
@@ -91,14 +195,99 @@ class BleMeshChat {
   bool _initialized = false;
   bool _flushing = false;
 
+  /// Messages sent by this device, messages received for it, and, during
+  /// [initialize], history replayed from the store. Broadcast.
+  ///
+  /// History is emitted before any transport starts; subscribe before
+  /// calling [initialize] to receive it. Each received packet id is emitted
+  /// at most once.
   Stream<ChatMessage> get messages => _messages.stream;
+
+  /// Every peer currently listed by any transport, emitted whenever a
+  /// transport reports a change. Broadcast. A peer reachable over several
+  /// transports appears once per transport.
   Stream<List<ChatPeer>> get peers => _peers.stream;
+
+  /// Every known group, emitted after a group is created, its membership
+  /// changes, or a newer key update is accepted. Broadcast.
   Stream<List<ChatGroup>> get groupChanges => _groupChanges.stream;
+
+  /// Delivery state changes for this device's messages, plus states replayed
+  /// from the store during [initialize]. Broadcast.
+  ///
+  /// Nothing more is emitted for a message after [MessageState.delivered].
   Stream<MessageStateChange> get messageStates => _states.stream;
+
+  /// Non-fatal failures: transport and store errors, rejected or
+  /// unauthenticated packets, unknown senders on contacts-only transports,
+  /// and exhausted rate limits (reported at most once a minute per budget).
+  /// Broadcast. Processing continues after every error.
   Stream<Object> get errors => _errors.stream;
+
+  /// Whether [initialize] has been called and [dispose] has not.
   bool get isInitialized => _initialized;
+
+  /// Whether packets this device creates may be carried between BLE and
+  /// Nostr by gateways. Covers new direct messages and acknowledgements;
+  /// packets already sent keep the choice they were signed with.
+  bool get bridgeConsent => _bridgeConsent;
+
+  /// This device's gateway policy, or null when it is not a gateway.
+  BridgePolicy? get bridgePolicy => _bridgePolicy;
+
+  /// Whether this device is bridging now, and why not when it is not.
+  BridgeStatus get bridgeStatus => _computeBridgeStatus();
+
+  /// Emits [bridgeStatus] whenever it differs from the last value emitted.
+  /// Broadcast.
+  Stream<BridgeStatus> get bridgeStatusChanges => _bridgeStatus.stream;
+
+  /// Records the user's choice about letting gateways carry this device's
+  /// packets. Turning it on while offline registers with nearby gateways.
+  void setBridgeConsent(bool allow) {
+    _bridgeConsent = allow;
+    if (allow) unawaited(_sendRegistration(force: true));
+  }
+
+  /// Makes this device a gateway under [policy], or stops bridging when
+  /// null. Should follow an explicit choice by this device's user.
+  void setBridgePolicy(BridgePolicy? policy) {
+    _bridgePolicy = policy;
+    _bridgeBucket = _bridgeBucketFor(policy, _clock);
+    if (policy == null || !policy.nostrToBle) _bridgeRoutes.clear();
+    _refreshBridge();
+  }
+
+  /// Reports the current connection so the policy's metered and roaming
+  /// rules can be applied. The plugin cannot observe these itself.
+  void updateNetworkConditions(NetworkConditions conditions) {
+    _network = conditions;
+    _refreshBridge();
+  }
+
+  static TokenBuckets _bridgeBucketFor(
+    BridgePolicy? policy,
+    DateTime Function()? clock,
+  ) {
+    final perMinute = policy?.maximumPacketsPerMinute ?? 1;
+    return TokenBuckets(
+      InboundRateLimit(burst: perMinute, perSecond: perMinute / 60),
+      maximumKeys: 1,
+      clock: clock,
+    );
+  }
+
+  /// Groups this device holds a key for, by group id. Unmodifiable snapshot.
   Map<String, ChatGroup> get groups => Map.unmodifiable(_groups);
 
+  /// Opens the stores, replays history, starts [transports], and sends any
+  /// queued packets that have a route.
+  ///
+  /// Expired queued messages are marked [MessageState.failed]. A transport
+  /// that fails to start is reported on [errors] and does not abort the
+  /// call. Throws [StateError] when already initialized, and
+  /// [ArgumentError] when [transports] is empty or [identity] does not match
+  /// [security]'s signing identity.
   Future<void> initialize({
     required ChatIdentity identity,
     required List<ChatTransport> transports,
@@ -128,6 +317,10 @@ class BleMeshChat {
         transport.incoming.listen(_enqueueInbound, onError: _errors.add),
         transport.availabilityChanges.listen((available) {
           if (available) unawaited(_flushQueue());
+          _refreshBridge();
+          if (available && transport is! RelayChatTransport) {
+            unawaited(_sendRegistration());
+          }
         }, onError: _errors.add),
         transport.peers.listen(
           (peers) => _updatePeers(transport.id, peers),
@@ -140,14 +333,38 @@ class BleMeshChat {
         _errors.add(error);
       }
     }
+    _bridgeTimer = Timer.periodic(bridgeRegistrationInterval, (_) {
+      _refreshBridge();
+      unawaited(_sendRegistration());
+    });
+    _refreshBridge();
+    await _sendRegistration();
     await _flushQueue();
   }
 
+  /// Sends [text] to the public channel [conversationId].
+  ///
+  /// With [security] the packet is signed but readable by anyone on the
+  /// mesh; use [sendGroup] for confidential group chat. The message is
+  /// emitted on [messages] before transmission is attempted, and the
+  /// returned future completes after the first attempt; follow
+  /// [messageStates] for progress. A packet no route accepted is queued and
+  /// retried until [messageLifetime] elapses; if the store refuses it, the
+  /// message is marked [MessageState.failed]. Throws [ArgumentError] when
+  /// [text] is empty, [StateError] before [initialize], and
+  /// [SeenPacketQuotaException] when the store's replay index is full.
   Future<ChatMessage> send({
     required String conversationId,
     required String text,
   }) => _sendMessage(destination: 'c:$conversationId', text: text);
 
+  /// Sends [text] to the peer [peerId].
+  ///
+  /// With [security] the packet is sealed to the recipient's key, and
+  /// [MessageSecurityException] is thrown when that key is unknown or has
+  /// changed without approval. The message stays queued for retry until the
+  /// recipient acknowledges it ([MessageState.delivered]) or
+  /// [messageLifetime] elapses. Otherwise behaves like [send].
   Future<ChatMessage> sendDirect({
     required String peerId,
     required String text,
@@ -203,6 +420,12 @@ class BleMeshChat {
     return next;
   }
 
+  /// Encrypts [text] under the current key of group [groupId] and sends it.
+  ///
+  /// Throws [StateError] when [security] is absent, the group is unknown, or
+  /// this device is not a member, and [ArgumentError] when [text] is empty.
+  /// A queued message is marked [MessageState.failed] if the group's epoch
+  /// or membership changes before a route accepts it.
   Future<ChatMessage> sendGroup({
     required String groupId,
     required String text,
@@ -365,6 +588,7 @@ class BleMeshChat {
       createdAt: now,
       expiresAt: now.add(messageLifetime),
       payload: utf8.encode(text),
+      bridgeable: isDirect && _bridgeConsent,
     );
     final keyed = security;
     if (keyed != null) {
@@ -487,12 +711,18 @@ class BleMeshChat {
       _emitState(packet.id, MessageState.sending);
     }
     var deliveredRoutes = 0;
-    for (final transport in _transports.where((item) => item.available)) {
-      try {
-        final result = await transport.send(packet);
-        deliveredRoutes += result.deliveredRoutes;
-      } on Object catch (error) {
-        _errors.add(error);
+    final (primary, fallback) = _routesFor(packet);
+    for (final transports in [primary, fallback]) {
+      // The fallback runs only when every preferred transport came up
+      // empty, for example a BLE listing that outlived its links.
+      if (deliveredRoutes > 0) break;
+      for (final transport in transports) {
+        try {
+          final result = await transport.send(packet);
+          deliveredRoutes += result.deliveredRoutes;
+        } on Object catch (error) {
+          _errors.add(error);
+        }
       }
     }
     if (_acknowledgedPacketIds.containsKey(packet.id)) return true;
@@ -500,6 +730,12 @@ class BleMeshChat {
         packet.destination.startsWith('p:') &&
         (packet.type == ChatPacketType.message ||
             packet.type == ChatPacketType.groupKeyUpdate);
+    if (requiresAck && deliveredRoutes > 0) {
+      while (_unacknowledgedPacketIds.length >= 4096) {
+        _unacknowledgedPacketIds.remove(_unacknowledgedPacketIds.first);
+      }
+      _unacknowledgedPacketIds.add(packet.id);
+    }
     if (deliveredRoutes > 0 && !requiresAck) {
       await _store.remove(packet.id);
       if (packet.type == ChatPacketType.message ||
@@ -534,11 +770,48 @@ class BleMeshChat {
     return deliveredRoutes > 0;
   }
 
+  /// Chooses transports for [packet]: a primary set, and a fallback tried
+  /// in the same attempt only if the primary set delivers to no route.
+  ///
+  /// A direct packet goes first over transports on which its recipient is
+  /// currently listed, so a nearby peer is reached over BLE without also
+  /// publishing to relays. If those deliver nothing, the other available
+  /// transports are tried at once. Once a route has accepted the packet and
+  /// no acknowledgement came back, retries use every available transport: a
+  /// stale nearby listing must not strand a message that another route could
+  /// deliver.
+  (List<ChatTransport>, List<ChatTransport>) _routesFor(ChatPacket packet) {
+    final available = _transports.where((item) => item.available).toList();
+    if (redundantDelivery ||
+        !packet.destination.startsWith('p:') ||
+        _unacknowledgedPacketIds.contains(packet.id)) {
+      return (available, const []);
+    }
+    final peerId = packet.destination.substring(2);
+    final preferred = available
+        .where((item) => _knownPeers.containsKey('${item.id}:$peerId'))
+        .toList();
+    if (preferred.isEmpty) return (available, const []);
+    return (
+      preferred,
+      available.where((item) => !preferred.contains(item)).toList(),
+    );
+  }
+
   void _enqueueInbound(
     ReceivedChatPacket received, {
     bool replayGroup = false,
   }) {
     if (!_initialized || _pendingInbound >= maximumPendingInbound) return;
+    // Spend the route budget before any signature work, so a neighbour
+    // cannot make us burn CPU faster than it is allowed to send.
+    if (!replayGroup &&
+        !_withinBudget(
+          _routeBuckets,
+          'route:${received.transportId}:${received.routeId}',
+        )) {
+      return;
+    }
     _pendingInbound++;
     _inboundWork = _inboundWork
         .then((_) => _onPacket(received, replayGroup: replayGroup))
@@ -556,10 +829,40 @@ class BleMeshChat {
     final identity = _requireIdentity();
     final now = _clock();
     if (packet.isExpired(now)) return;
+    if (!replayGroup && !_plausibleLifetime(packet, now)) {
+      _errors.add(
+        const MessageSecurityException('implausible packet lifetime'),
+      );
+      return;
+    }
 
     final keyed = security;
     final directForUsEarly = packet.destination == 'p:${identity.peerId}';
+    final arrivedOnline = _isOnline(received.transportId);
+    if (arrivedOnline && !directForUsEarly && !_mayBridgeToLocal(packet)) {
+      // Relays only deliver others' traffic to a gateway, and only for
+      // devices that registered with it.
+      return;
+    }
+    // A bridgeable packet may have crossed from the internet, so one
+    // addressed to us is held to the strictest contact policy in use.
+    final contactsOnly =
+        (contactsOnlyTransports.contains(received.transportId) &&
+            !(arrivedOnline && !directForUsEarly)) ||
+        (packet.bridgeable &&
+            directForUsEarly &&
+            contactsOnlyTransports.isNotEmpty);
     if (keyed != null) {
+      if (contactsOnly &&
+          packet.senderId != identity.peerId &&
+          keyed.trustStore.keysFor(packet.senderId) == null) {
+        // Checked before admit(), which would otherwise pin the stranger on
+        // first contact. No ACK is sent, so probing learns nothing.
+        _errors.add(
+          UnknownSenderException(packet.senderId, received.transportId),
+        );
+        return;
+      }
       try {
         if (directForUsEarly) {
           // Addressed to us, so open it as well as authenticate it.
@@ -632,8 +935,16 @@ class BleMeshChat {
                 packet.type == ChatPacketType.groupKeyUpdate)) {
           await _sendAcknowledgement(packet, received);
         }
+        // An origin retrying through a gateway that failed to publish the
+        // first copy gets another chance here; a packet already carried
+        // across is not carried again.
+        if (!directForUs) await _maybeBridge(received, packet);
         return;
       }
+      // Charged after authentication, so the id cannot be forged to spend
+      // someone else's budget, and before the id is reserved, so a dropped
+      // packet can still be delivered when its sender retries.
+      if (!_withinBudget(_senderBuckets, 'sender:${packet.senderId}')) return;
       if (!_dedupe.remember(packet.id, packet.expiresAt)) return;
       await _store.rememberSeen(packet.id, packet.expiresAt);
     }
@@ -657,6 +968,7 @@ class BleMeshChat {
       _acknowledgedPacketIds[acknowledgedId] = packet.expiresAt;
       await _store.remove(acknowledgedId);
       _recipientByPacketId.remove(acknowledgedId);
+      _unacknowledgedPacketIds.remove(acknowledgedId);
       if (_messageIdByPacketId.containsKey(acknowledgedId) ||
           _restoredMessageIds.contains(acknowledgedId)) {
         _emitState(messageId, MessageState.delivered);
@@ -698,7 +1010,13 @@ class BleMeshChat {
       }
     }
 
-    final shouldRelay = packet.ttl > 1 && !directForUs && !replayGroup;
+    if (packet.type == ChatPacketType.bridgeRegistration && !replayGroup) {
+      _onRegistration(received, packet);
+    }
+
+    // Relays are not a mesh: nothing that arrived online is flooded back.
+    final shouldRelay =
+        packet.ttl > 1 && !directForUs && !replayGroup && !arrivedOnline;
     if (shouldRelay) {
       _relayCache.removeWhere((_, item) => item.packet.isExpired(_clock()));
       if (_relayCache.length >= 256) {
@@ -707,6 +1025,246 @@ class BleMeshChat {
       _relayCache[packet.id] = received;
       await _relay(received);
     }
+    if (!directForUs && !replayGroup) await _maybeBridge(received, packet);
+  }
+
+  bool _isOnline(String transportId) => _transports.any(
+    (transport) =>
+        transport.id == transportId && transport is RelayChatTransport,
+  );
+
+  Iterable<RelayChatTransport> get _onlineTransports =>
+      _transports.whereType<RelayChatTransport>();
+
+  Iterable<ChatTransport> get _localTransports =>
+      _transports.where((transport) => transport is! RelayChatTransport);
+
+  /// Whether a packet that arrived online, not addressed to us, is one this
+  /// gateway should carry onto BLE.
+  bool _mayBridgeToLocal(ChatPacket packet) {
+    final policy = _bridgePolicy;
+    if (policy == null || !policy.nostrToBle || !packet.bridgeable) {
+      return false;
+    }
+    if (!packet.destination.startsWith('p:')) return false;
+    final expiry = _bridgeRoutes[packet.destination.substring(2)];
+    return expiry != null && expiry.isAfter(_clock());
+  }
+
+  static bool _bridgedType(ChatPacketType type) =>
+      type == ChatPacketType.message || type == ChatPacketType.acknowledgement;
+
+  /// Carries [packet] between BLE and Nostr when every condition holds: the
+  /// origin consented, this device is an active gateway, the packet is a
+  /// live direct message or acknowledgement with hops left, it has not
+  /// crossed here before, and the bridge budget allows it.
+  ///
+  /// Crossing costs a hop and packet ids never change, so a packet that
+  /// meets several gateways is deduplicated everywhere and stops within
+  /// its TTL and expiry.
+  Future<void> _maybeBridge(
+    ReceivedChatPacket received,
+    ChatPacket packet,
+  ) async {
+    final policy = _bridgePolicy;
+    if (policy == null ||
+        !packet.bridgeable ||
+        !_bridgedType(packet.type) ||
+        packet.ttl <= 1 ||
+        !packet.destination.startsWith('p:') ||
+        packet.senderId == _identity?.peerId ||
+        _bridgeInactiveReason() != null) {
+      return;
+    }
+    final now = _clock();
+    if (packet.isExpired(now)) return;
+    _bridgedPacketIds.removeWhere((_, expiry) => !expiry.isAfter(now));
+    if (_bridgedPacketIds.containsKey(packet.id)) return;
+    final recipient = packet.destination.substring(2);
+    final forwarded = packet.withTtl(packet.ttl - 1);
+    var delivered = 0;
+    if (_isOnline(received.transportId)) {
+      if (!_mayBridgeToLocal(packet)) return;
+      if (!_withinBudget(_bridgeBucket, 'bridge')) return;
+      for (final transport in _localTransports.where(
+        (item) => item.available,
+      )) {
+        try {
+          delivered += (await transport.send(forwarded)).deliveredRoutes;
+        } on Object catch (error) {
+          _errors.add(error);
+        }
+      }
+    } else {
+      if (!policy.bleToNostr) return;
+      // A recipient listed on a local transport is already reachable there.
+      if (_knownPeers.values.any(
+        (peer) => peer.id == recipient && !_isOnline(peer.transportId),
+      )) {
+        return;
+      }
+      if (!_withinBudget(_bridgeBucket, 'bridge')) return;
+      for (final online in _onlineTransports.where((item) => item.available)) {
+        try {
+          delivered += (await online.bridge(forwarded)).deliveredRoutes;
+        } on Object catch (error) {
+          _errors.add(error);
+        }
+      }
+    }
+    if (delivered == 0) return;
+    while (_bridgedPacketIds.length >= 4096) {
+      _bridgedPacketIds.remove(_bridgedPacketIds.keys.first);
+    }
+    _bridgedPacketIds[packet.id] = packet.expiresAt;
+    _bridgedPacketCount++;
+    _publishBridgeStatus();
+  }
+
+  /// Records a nearby device's request to receive its online traffic here.
+  void _onRegistration(ReceivedChatPacket received, ChatPacket packet) {
+    final policy = _bridgePolicy;
+    if (policy == null ||
+        !policy.nostrToBle ||
+        security == null ||
+        _isOnline(received.transportId) ||
+        !packet.bridgeable ||
+        packet.isSealed ||
+        packet.destination != '*' ||
+        packet.senderId == _identity?.peerId ||
+        packet.expiresAt.difference(packet.createdAt) >
+            _maximumRegistrationLifetime) {
+      return;
+    }
+    final now = _clock();
+    _bridgeRoutes.removeWhere((_, expiry) => !expiry.isAfter(now));
+    if (!_bridgeRoutes.containsKey(packet.senderId) &&
+        _bridgeRoutes.length >= policy.maximumRoutes) {
+      return;
+    }
+    _bridgeRoutes[packet.senderId] = packet.expiresAt;
+    _refreshBridge();
+  }
+
+  /// Asks nearby gateways to receive this device's online traffic.
+  ///
+  /// Sent only with consent, only while no relay is reachable directly, and
+  /// only over local transports. A device that is online itself does not
+  /// need a gateway and should not reveal its presence to one.
+  Future<void> _sendRegistration({bool force = false}) async {
+    final keyed = security;
+    final identity = _identity;
+    if (!_initialized || !_bridgeConsent || keyed == null || identity == null) {
+      return;
+    }
+    if (_onlineTransports.any((item) => item.available)) return;
+    final locals = _localTransports.where((item) => item.available).toList();
+    if (locals.isEmpty) return;
+    final now = _clock();
+    final last = _lastRegistrationAt;
+    if (!force &&
+        last != null &&
+        now.difference(last) < bridgeRegistrationInterval ~/ 8) {
+      return;
+    }
+    _lastRegistrationAt = now;
+    final packet = await keyed.protect(
+      ChatPacket(
+        type: ChatPacketType.bridgeRegistration,
+        packetId: createPacketId(_random),
+        senderId: identity.peerId,
+        destination: '*',
+        ttl: 3,
+        createdAt: now,
+        expiresAt: now.add(_registrationLifetime),
+        payload: Uint8List(0),
+        bridgeable: true,
+      ),
+      encrypt: false,
+    );
+    _dedupe.remember(packet.id, packet.expiresAt);
+    for (final transport in locals) {
+      try {
+        await transport.send(packet);
+      } on Object catch (error) {
+        _errors.add(error);
+      }
+    }
+  }
+
+  BridgeInactiveReason? _bridgeInactiveReason() {
+    final policy = _bridgePolicy;
+    if (policy == null) return BridgeInactiveReason.disabled;
+    if (security == null) return BridgeInactiveReason.requiresSecurity;
+    if (!_onlineTransports.any((item) => item.available)) {
+      return BridgeInactiveReason.relaysUnavailable;
+    }
+    if (!policy.allowMetered || !policy.allowRoaming) {
+      final network = _network;
+      if (network == null) return BridgeInactiveReason.networkConditionsUnknown;
+      if (network.metered && !policy.allowMetered) {
+        return BridgeInactiveReason.metered;
+      }
+      if (network.roaming && !policy.allowRoaming) {
+        return BridgeInactiveReason.roaming;
+      }
+    }
+    return null;
+  }
+
+  BridgeStatus _computeBridgeStatus() {
+    final reason = _bridgeInactiveReason();
+    final now = _clock();
+    return BridgeStatus(
+      active: reason == null,
+      reason: reason,
+      bridgedPeers: reason == null
+          ? _bridgeRoutes.values.where((expiry) => expiry.isAfter(now)).length
+          : 0,
+      bridgedPackets: _bridgedPacketCount,
+    );
+  }
+
+  /// Aligns relay subscriptions with live registrations and publishes any
+  /// status change.
+  void _refreshBridge() {
+    final now = _clock();
+    _bridgeRoutes.removeWhere((_, expiry) => !expiry.isAfter(now));
+    final policy = _bridgePolicy;
+    final receiving = _bridgeInactiveReason() == null && policy!.nostrToBle
+        ? _bridgeRoutes.keys.toSet()
+        : const <String>{};
+    for (final online in _onlineTransports) {
+      online.setBridgedPeers(receiving);
+    }
+    _publishBridgeStatus();
+  }
+
+  void _publishBridgeStatus() {
+    final status = _computeBridgeStatus();
+    if (status == _lastBridgeStatus || _bridgeStatus.isClosed) return;
+    _lastBridgeStatus = status;
+    _bridgeStatus.add(status);
+  }
+
+  bool _plausibleLifetime(ChatPacket packet, DateTime now) =>
+      !packet.createdAt.isAfter(now.add(maximumClockSkew)) &&
+      packet.expiresAt.isAfter(packet.createdAt) &&
+      packet.expiresAt.difference(packet.createdAt) <= maximumPacketLifetime;
+
+  /// Spends a token, reporting a newly exhausted budget at most once a
+  /// minute per key.
+  bool _withinBudget(TokenBuckets buckets, String key) {
+    if (buckets.take(key)) return true;
+    final now = _clock();
+    _lastLimitReport.removeWhere(
+      (_, at) => now.difference(at) >= const Duration(minutes: 1),
+    );
+    if (!_lastLimitReport.containsKey(key) && _lastLimitReport.length < 256) {
+      _lastLimitReport[key] = now;
+      _errors.add(InboundRateLimitedException(key));
+    }
+    return false;
   }
 
   Future<void> _relay(ReceivedChatPacket received) async {
@@ -725,14 +1283,13 @@ class BleMeshChat {
       await Future<void>.delayed(Duration(milliseconds: jitterMs));
     }
     final forwarded = packet.withTtl(packet.ttl - 1);
-    for (final transport in _transports.where((item) => item.available)) {
+    // Forward only on the transport the packet arrived on. Crossing between
+    // BLE and Nostr is bridging, which needs consent and loop prevention.
+    for (final transport in _transports.where(
+      (item) => item.available && item.id == received.transportId,
+    )) {
       try {
-        await transport.send(
-          forwarded,
-          excludeRouteId: transport.id == received.transportId
-              ? received.routeId
-              : null,
-        );
+        await transport.send(forwarded, excludeRouteId: received.routeId);
       } on Object catch (error) {
         _errors.add(error);
       }
@@ -762,6 +1319,9 @@ class BleMeshChat {
       createdAt: now,
       expiresAt: original.expiresAt,
       payload: utf8.encode(original.id),
+      // The reply may take the path the original took, but only if this
+      // device consents as well.
+      bridgeable: original.bridgeable && _bridgeConsent,
     );
     final keyed = security;
     if (keyed != null) {
@@ -906,9 +1466,17 @@ class BleMeshChat {
     return identity;
   }
 
+  /// Stops retries, waits for inbound processing to finish, closes the
+  /// message store, stops and disposes the transports, and closes every
+  /// stream.
+  ///
+  /// Do not reuse the instance afterwards: its streams are closed. The group
+  /// store is not closed.
   Future<void> dispose() async {
     _retryTimer?.cancel();
     _retryTimer = null;
+    _bridgeTimer?.cancel();
+    _bridgeTimer = null;
     for (final subscription in _subscriptions) {
       await subscription.cancel();
     }
@@ -919,11 +1487,13 @@ class BleMeshChat {
     for (final transport in _transports) {
       await transport.stop();
       if (transport is BleChatTransport) await transport.dispose();
+      if (transport is RelayChatTransport) await transport.dispose();
     }
     await _messages.close();
     await _peers.close();
     await _groupChanges.close();
     await _states.close();
+    await _bridgeStatus.close();
     await _errors.close();
   }
 }

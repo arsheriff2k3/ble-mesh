@@ -1,6 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Online delivery through Nostr relays. -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <application
-        android:label="ble_mesh_example"
+        android:label="${appLabel}"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

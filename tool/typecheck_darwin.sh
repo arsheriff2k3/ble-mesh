@@ -21,7 +21,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-SOURCES="darwin/ble_mesh/Sources/ble_mesh"
+SOURCES="darwin/ble_mesh_chat/Sources/ble_mesh_chat"
 
 if ! command -v swiftc >/dev/null 2>&1; then
   echo "swiftc not found. Install the Xcode Command Line Tools:" >&2

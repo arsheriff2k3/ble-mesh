@@ -2,13 +2,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:ble_mesh/ble_mesh.dart';
-import 'package:ble_mesh/file_store.dart';
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
+import 'package:ble_mesh_chat/file_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'test_chat_transport.dart';
 
-/// Phase 2: a message written while nothing is reachable has to outlive the
+/// A message written while nothing is reachable has to outlive the
 /// process and go out once a route appears, exactly once.
 void main() {
   late Directory directory;
@@ -78,7 +78,13 @@ void main() {
     secondRun.messageStates.listen((change) => secondStates.add(change.state));
 
     aTransport.connect(bTransport);
-    await pumpEventQueue(times: 30);
+    // The file store does real disk I/O, which a fixed number of event queue
+    // turns does not wait for when the machine is busy.
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (!secondStates.contains(MessageState.delivered) &&
+        DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
 
     expect(delivered.map((message) => message.text), ['survives a restart']);
     expect(secondStates, contains(MessageState.sent));
@@ -190,7 +196,12 @@ void main() {
     final before = <ChatMessage>[];
     first.messages.listen(before.add);
     transport.inject(replayed, from: neighbor);
-    await pumpEventQueue(times: 10);
+    // The seen id is written to disk; wait for the message rather than a
+    // fixed number of event-queue turns.
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (before.isEmpty && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
     expect(before, hasLength(1));
     await first.dispose();
 
@@ -213,7 +224,9 @@ void main() {
     // Only listen once history has replayed, so this counts new arrivals.
     second.messages.listen(after.add);
     reopened.inject(replayed, from: other);
-    await pumpEventQueue(times: 10);
+    // A negative result cannot be waited for, so allow real time for the
+    // store lookup instead of a fixed number of event-queue turns.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
 
     expect(after, isEmpty, reason: 'the replay must still be a duplicate');
   });

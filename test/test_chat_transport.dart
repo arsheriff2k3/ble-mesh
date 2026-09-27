@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:ble_mesh/ble_mesh.dart';
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
 
 /// In-memory [ChatTransport] used to build topologies without radios.
 class TestChatTransport implements ChatTransport {
@@ -30,6 +30,16 @@ class TestChatTransport implements ChatTransport {
     _availability.add(true);
     other._availability.add(true);
   }
+
+  void disconnect(TestChatTransport other) {
+    _neighbors.remove(other.nodeId);
+    other._neighbors.remove(nodeId);
+    if (_neighbors.isEmpty) _availability.add(false);
+    if (other._neighbors.isEmpty) other._availability.add(false);
+  }
+
+  /// Publishes [peers] as the peers currently reachable on this transport.
+  void announcePeers(List<ChatPeer> peers) => _peers.add(peers);
 
   void inject(ChatPacket packet, {required TestChatTransport from}) {
     _incoming.add(

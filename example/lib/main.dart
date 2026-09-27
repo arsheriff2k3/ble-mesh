@@ -2,8 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:ble_mesh/ble_mesh.dart';
-import 'package:ble_mesh/file_store.dart';
+import 'package:ble_mesh_chat/ble_mesh_chat.dart';
+import 'package:ble_mesh_chat/file_store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -31,13 +31,20 @@ class ChatPage extends StatefulWidget {
 /// Conversation id used for the shared broadcast channel.
 const _generalChannel = 'general';
 
-class _ChatPageState extends State<ChatPage> {
+class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   ChatIdentity? _identity;
   IdentityStore? _identityStore;
   PacketSecurity? _security;
   BleMeshTransport? _ble;
   BleChatTransport? _chatTransport;
+  NostrChatTransport? _nostr;
   BleMeshChat? _chat;
+  File? _relayFile;
+  List<String> _relayUrls = const [];
+  List<Uri> _connectedRelays = const [];
+  File? _bridgeFile;
+  _BridgeSettings _bridge = const _BridgeSettings();
+  BridgeStatus? _bridgeStatus;
   final _text = TextEditingController();
   final _subscriptions = <StreamSubscription<void>>[];
   final _messages = <ChatMessage>[];
@@ -60,6 +67,7 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(
       _bootstrap().catchError((Object error) {
         if (mounted) setState(() => _startupError = error);
@@ -74,6 +82,12 @@ class _ChatPageState extends State<ChatPage> {
   /// conversation would point at a peer nobody recognises.
   Future<void> _bootstrap() async {
     final directory = await getApplicationSupportDirectory();
+    final relayFile = File('${directory.path}/relays.txt');
+    final relayUrls = await relayFile.exists()
+        ? _parseRelayList(await relayFile.readAsString())
+        : const <String>[];
+    final bridgeFile = File('${directory.path}/bridge.json');
+    final bridge = await _BridgeSettings.load(bridgeFile);
 
     // Private keys go to Android Keystore / iOS Keychain; pinned peer keys are
     // public, so they sit beside the message log.
@@ -111,7 +125,12 @@ class _ChatPageState extends State<ChatPage> {
       // Space out a backlog so a reconnect after a long offline stretch does
       // not hit neighbours with everything at once.
       retrySpacing: const Duration(milliseconds: 120),
+      // Both are off until this device's user turns them on.
+      bridgeConsent: bridge.consent,
+      bridgePolicy: bridge.policy,
     );
+    // This harness has no connectivity detection; the user reports it.
+    chat.updateNetworkConditions(bridge.conditions);
     final ble = BleMeshTransport();
     final chatTransport = BleChatTransport(
       identity: identity,
@@ -126,6 +145,11 @@ class _ChatPageState extends State<ChatPage> {
       _ble = ble;
       _chat = chat;
       _chatTransport = chatTransport;
+      _relayFile = relayFile;
+      _relayUrls = relayUrls;
+      _bridgeFile = bridgeFile;
+      _bridge = bridge;
+      _bridgeStatus = chat.bridgeStatus;
     });
     _listen(chat, chatTransport, ble);
     _append('identity ${identity.peerId}');
@@ -177,6 +201,10 @@ class _ChatPageState extends State<ChatPage> {
         _append('${state.messageId.substring(0, 8)}: ${state.state.name}');
       }),
       chat.errors.listen((error) => _append('chat error: $error')),
+      chat.bridgeStatusChanges.listen((status) {
+        if (mounted) setState(() => _bridgeStatus = status);
+        _append('bridge: $status');
+      }),
       chatTransport.errors.listen(_onSecurityError),
       ble.adapterState.listen((state) {
         if (!mounted) return;
@@ -205,12 +233,19 @@ class _ChatPageState extends State<ChatPage> {
     }
     try {
       final permission = await ble.requestPermissions();
-      if (permission != BlePermissionState.granted &&
-          permission != BlePermissionState.notRequired) {
-        _append('Bluetooth permission: ${permission.name}');
-        return;
-      }
-      await chat.initialize(identity: identity, transports: [transport]);
+      final bleAllowed =
+          permission == BlePermissionState.granted ||
+          permission == BlePermissionState.notRequired;
+      if (!bleAllowed) _append('Bluetooth permission: ${permission.name}');
+      // Relays keep direct messages flowing to peers outside BLE range, and
+      // are the only route when Bluetooth is unavailable.
+      final online = _createNostr(identity);
+      final transports = <ChatTransport>[
+        ?(bleAllowed ? transport : null),
+        ?online,
+      ];
+      if (transports.isEmpty) return;
+      await chat.initialize(identity: identity, transports: transports);
       if (mounted) setState(() => _running = true);
       _append('mesh chat started as ${identity.peerId}');
     } on PlatformException catch (error) {
@@ -218,6 +253,315 @@ class _ChatPageState extends State<ChatPage> {
     } on Object catch (error) {
       _append('start failed: $error');
     }
+  }
+
+  /// Returning to the app usually follows a trip to Settings to switch
+  /// Wi-Fi, mobile data, or Bluetooth. Reconnect relays now instead of
+  /// waiting out the backoff; the BLE radio recovers on its own.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _nostr?.reconnectNow();
+  }
+
+  /// Always created, even with no relays, so relays can be added later
+  /// without restarting the app.
+  NostrChatTransport? _createNostr(ChatIdentity identity) {
+    try {
+      final nostr = NostrChatTransport(identity: identity, relays: _relayUrls);
+      _subscriptions.addAll([
+        nostr.errors.listen((error) => _append('relay: $error')),
+        nostr.connectedRelayChanges.listen((relays) {
+          if (mounted) setState(() => _connectedRelays = relays);
+        }),
+      ]);
+      _nostr = nostr;
+      return nostr;
+    } on ArgumentError catch (error) {
+      _append('relays ignored: ${error.message}');
+      return null;
+    }
+  }
+
+  static List<String> _parseRelayList(String text) => text
+      .split(RegExp(r'[\s,]+'))
+      .where((value) => value.isNotEmpty)
+      .toSet()
+      .toList(growable: false);
+
+  Future<void> _editRelays() async {
+    final file = _relayFile;
+    if (file == null) return;
+    final controller = TextEditingController(text: _relayUrls.join('\n'));
+    final saved = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Online relays'),
+        content: SizedBox(
+          width: 360,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'One wss:// Nostr relay per line. Direct messages to peers '
+                'outside BLE range are published there as encrypted events. '
+                'Leave empty to stay offline-only.',
+              ),
+              TextField(
+                controller: controller,
+                minLines: 3,
+                maxLines: 6,
+                keyboardType: TextInputType.url,
+                decoration: const InputDecoration(
+                  hintText: 'wss://relay.example.com',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (saved == null) return;
+    final urls = _parseRelayList(saved);
+    try {
+      await file.writeAsString(urls.join('\n'), flush: true);
+    } on Object catch (error) {
+      _append('Could not save relays: $error');
+      return;
+    }
+    final nostr = _nostr;
+    if (nostr != null) {
+      try {
+        await nostr.setRelays(urls);
+      } on ArgumentError catch (error) {
+        _append('relays not applied: ${error.message}');
+        return;
+      }
+    }
+    if (mounted) setState(() => _relayUrls = urls);
+    _append('Relays saved: ${urls.length}');
+  }
+
+  Future<void> _editBridge() async {
+    final chat = _chat;
+    final file = _bridgeFile;
+    if (chat == null || file == null) return;
+    var draft = _bridge;
+    final saved = await showDialog<_BridgeSettings>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('Gateway and bridging'),
+          content: SizedBox(
+            width: 380,
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                SwitchListTile(
+                  title: const Text('Let gateways carry my messages'),
+                  subtitle: const Text(
+                    'When you have no internet, nearby gateways may publish '
+                    'your encrypted direct messages to relays. Relays see '
+                    'who you write to and when, not what.',
+                  ),
+                  value: draft.consent,
+                  onChanged: (value) =>
+                      update(() => draft = draft.copyWith(consent: value)),
+                ),
+                const Divider(),
+                SwitchListTile(
+                  title: const Text('Act as a gateway'),
+                  subtitle: const Text(
+                    "Uses this phone's data and battery to carry other "
+                    "people's encrypted messages between Bluetooth and the "
+                    'internet.',
+                  ),
+                  value: draft.gateway,
+                  onChanged: (value) =>
+                      update(() => draft = draft.copyWith(gateway: value)),
+                ),
+                SwitchListTile(
+                  title: const Text('Allow on metered data'),
+                  value: draft.allowMetered,
+                  onChanged: draft.gateway
+                      ? (value) => update(
+                          () => draft = draft.copyWith(allowMetered: value),
+                        )
+                      : null,
+                ),
+                SwitchListTile(
+                  title: const Text('Allow while roaming'),
+                  value: draft.allowRoaming,
+                  onChanged: draft.gateway
+                      ? (value) => update(
+                          () => draft = draft.copyWith(allowRoaming: value),
+                        )
+                      : null,
+                ),
+                const Divider(),
+                const ListTile(
+                  dense: true,
+                  title: Text(
+                    'Current connection (set by hand in this harness)',
+                  ),
+                ),
+                CheckboxListTile(
+                  title: const Text('Metered (cellular or hotspot)'),
+                  value: draft.metered,
+                  onChanged: (value) =>
+                      update(() => draft = draft.copyWith(metered: value)),
+                ),
+                CheckboxListTile(
+                  title: const Text('Roaming'),
+                  value: draft.roaming,
+                  onChanged: (value) =>
+                      update(() => draft = draft.copyWith(roaming: value)),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, draft),
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (saved == null) return;
+    try {
+      await saved.save(file);
+    } on Object catch (error) {
+      _append('Could not save bridge settings: $error');
+      return;
+    }
+    chat
+      ..setBridgeConsent(saved.consent)
+      ..setBridgePolicy(saved.policy)
+      ..updateNetworkConditions(saved.conditions);
+    if (mounted) {
+      setState(() {
+        _bridge = saved;
+        _bridgeStatus = chat.bridgeStatus;
+      });
+    }
+  }
+
+  String get _bridgeSummary {
+    final status = _bridgeStatus;
+    if (!_bridge.gateway || status == null) return '';
+    return status.active
+        ? ' · gateway: ${status.bridgedPeers} peers, ${status.bridgedPackets} carried'
+        : ' · gateway off: ${status.reason?.name}';
+  }
+
+  /// Shows this device's contact code and pins a pasted one, so two phones
+  /// that have never been in BLE range can message each other online.
+  Future<void> _contacts() async {
+    final security = _security;
+    final store = _identityStore;
+    final identity = _identity;
+    if (security == null || store == null || identity == null) return;
+    final myCode = security.identity.publicKeys.toContactCode();
+    final input = TextEditingController();
+    final code = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Contacts'),
+        content: SizedBox(
+          width: 360,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Your contact code',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+              SelectableText(
+                myCode,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+              ),
+              TextButton.icon(
+                onPressed: () => Clipboard.setData(ClipboardData(text: myCode)),
+                icon: const Icon(Icons.copy, size: 18),
+                label: const Text('Copy'),
+              ),
+              const Divider(),
+              TextField(
+                controller: input,
+                minLines: 1,
+                maxLines: 3,
+                decoration: const InputDecoration(
+                  labelText: "Paste a peer's code",
+                  helperText:
+                      'Only add codes received over a channel you trust.',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, input.text),
+            child: const Text('Add'),
+          ),
+        ],
+      ),
+    );
+    if (code == null || code.trim().isEmpty) return;
+    final ChatPublicKeys keys;
+    try {
+      keys = ChatPublicKeys.fromContactCode(code);
+    } on FormatException {
+      _append('Not a valid contact code.');
+      return;
+    }
+    if (keys.peerId == identity.peerId) {
+      _append("That is this device's own code.");
+      return;
+    }
+    switch (security.trustStore.classify(keys.peerId, keys)) {
+      case PeerTrust.changed:
+        _append(
+          '${keys.peerId} is already pinned with a different key; not replaced.',
+        );
+        return;
+      case PeerTrust.known:
+        _append('${keys.peerId} is already a contact.');
+      case PeerTrust.firstContact:
+        security.trustStore.observe(keys.peerId, keys);
+        try {
+          await store.saveTrust(security.trustStore);
+        } on Object catch (error) {
+          security.trustStore.forget(keys.peerId);
+          _append('Could not save contact: $error');
+          return;
+        }
+        _append(
+          'Added contact ${keys.peerId}. Safety number, to compare in '
+          'person: ${ChatPublicKeys.safetyNumber(security.identity.publicKeys, keys)}',
+        );
+    }
+    if (mounted) _selectThread(keys.peerId);
   }
 
   /// Every thread worth offering: the channel, connected peers, and any peer
@@ -423,6 +767,9 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   void _append(String value) {
+    // Mirrored to the system log so a tester can capture it with
+    // `adb logcat -s flutter`.
+    debugPrint('ble_mesh_harness: $value');
     if (!mounted) return;
     setState(() {
       _log.insert(0, value);
@@ -432,6 +779,7 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
     }
@@ -459,8 +807,11 @@ class _ChatPageState extends State<ChatPage> {
       builder: (context) => AlertDialog(
         title: const Text('Peer encryption key changed'),
         content: SelectableText(
-          'Compare this key with the peer before accepting.\n'
-          '${error.peerId}\n${base64Encode(error.proposedKeys.agreement)}',
+          'Compare this safety number with the peer in person before '
+          'accepting. A phone or video call is not enough: voices and faces '
+          'can be synthesized.\n\n'
+          '${error.peerId}\n'
+          '${ChatPublicKeys.safetyNumber(_security!.identity.publicKeys, error.proposedKeys)}',
         ),
         actions: [
           TextButton(
@@ -560,6 +911,27 @@ class _ChatPageState extends State<ChatPage> {
         title: const Text('ble_mesh chat harness'),
         actions: [
           IconButton(
+            tooltip: 'Contacts',
+            onPressed: _contacts,
+            icon: const Icon(Icons.person_add),
+          ),
+          IconButton(
+            tooltip: 'Online relays',
+            onPressed: _editRelays,
+            icon: Icon(
+              _relayUrls.isEmpty ? Icons.cloud_off : Icons.cloud_outlined,
+            ),
+          ),
+          IconButton(
+            tooltip: 'Gateway and bridging',
+            onPressed: _editBridge,
+            icon: Icon(
+              _bridge.gateway || _bridge.consent
+                  ? Icons.swap_horiz
+                  : Icons.sync_disabled,
+            ),
+          ),
+          IconButton(
             tooltip: 'Create encrypted group',
             onPressed: _running ? _createGroup : null,
             icon: const Icon(Icons.group_add),
@@ -578,160 +950,255 @@ class _ChatPageState extends State<ChatPage> {
           ),
         ],
       ),
-      body: Column(
-        children: [
-          Material(
-            color: Theme.of(context).colorScheme.surfaceContainer,
-            child: ListTile(
-              title: Text(identity.displayName),
-              subtitle: Text(
-                'adapter=${_adapter.name} · links=${_links.length} · '
-                'peers=${_peers.length}',
-              ),
-              trailing: FilledButton(
-                onPressed: _running || _restartRequired ? null : _start,
-                child: Text(
-                  _restartRequired
-                      ? 'Restart app'
-                      : _running
-                      ? 'Running'
-                      : 'Start',
+      // Keeps Diagnostics clear of the system navigation bar.
+      body: SafeArea(
+        top: false,
+        child: Column(
+          children: [
+            Material(
+              color: Theme.of(context).colorScheme.surfaceContainer,
+              child: ListTile(
+                title: Text(identity.displayName),
+                subtitle: Text(
+                  'adapter=${_adapter.name} · links=${_links.length} · '
+                  'peers=${_peers.length}'
+                  '${_relayUrls.isEmpty ? '' : ' · relays=${_connectedRelays.length}/${_relayUrls.length}'}'
+                  '$_bridgeSummary',
+                ),
+                trailing: FilledButton(
+                  onPressed: _running || _restartRequired ? null : _start,
+                  child: Text(
+                    _restartRequired
+                        ? 'Restart app'
+                        : _running
+                        ? 'Running'
+                        : 'Start',
+                  ),
                 ),
               ),
             ),
-          ),
-          SizedBox(
-            height: 52,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              children: [
-                for (final thread in _threads)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 4),
-                    child: Center(
-                      child: Badge.count(
-                        count: _unread[thread] ?? 0,
-                        isLabelVisible: (_unread[thread] ?? 0) > 0,
-                        child: ChoiceChip(
-                          selected: thread == _thread,
-                          onSelected: (_) => _selectThread(thread),
-                          avatar: thread == _generalChannel
-                              ? const Icon(Icons.tag, size: 18)
-                              : (_chat?.groups.containsKey(thread) ?? false)
-                              ? const Icon(Icons.group, size: 18)
-                              : Icon(
-                                  _hasKeyFor(thread)
-                                      ? Icons.lock
-                                      : _isConnected(thread)
-                                      ? Icons.lock_open
-                                      : Icons.signal_cellular_off,
-                                  size: 18,
-                                ),
-                          label: Text(_labelFor(thread)),
-                        ),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.all(12),
-              itemCount: _visibleMessages.length,
-              itemBuilder: (context, index) {
-                final message = _visibleMessages[index];
-                final state = _states[message.id];
-                return Align(
-                  alignment: message.isLocal
-                      ? Alignment.centerRight
-                      : Alignment.centerLeft,
-                  child: Card(
-                    color: message.isLocal
-                        ? Theme.of(context).colorScheme.primaryContainer
-                        : null,
-                    child: Padding(
-                      padding: const EdgeInsets.all(10),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            state == null
-                                ? message.senderId
-                                : '${message.senderId} · ${state.name}',
-                            style: Theme.of(context).textTheme.labelSmall,
+            SizedBox(
+              height: 52,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                children: [
+                  for (final thread in _threads)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      child: Center(
+                        child: Badge.count(
+                          count: _unread[thread] ?? 0,
+                          isLabelVisible: (_unread[thread] ?? 0) > 0,
+                          child: ChoiceChip(
+                            selected: thread == _thread,
+                            onSelected: (_) => _selectThread(thread),
+                            avatar: thread == _generalChannel
+                                ? const Icon(Icons.tag, size: 18)
+                                : (_chat?.groups.containsKey(thread) ?? false)
+                                ? const Icon(Icons.group, size: 18)
+                                : Icon(
+                                    _hasKeyFor(thread)
+                                        ? Icons.lock
+                                        : _isConnected(thread)
+                                        ? Icons.lock_open
+                                        : Icons.signal_cellular_off,
+                                    size: 18,
+                                  ),
+                            label: Text(_labelFor(thread)),
                           ),
-                          Text(message.text),
-                        ],
+                        ),
                       ),
                     ),
-                  ),
-                );
-              },
+                ],
+              ),
             ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _text,
-                    enabled: _running,
-                    onSubmitted: (_) => _send(),
-                    decoration: InputDecoration(
-                      border: const OutlineInputBorder(),
-                      hintText: _selectedPeerId == null
-                          ? 'Message #$_generalChannel'
-                          : (_chat?.groups.containsKey(_thread) ?? false)
-                          ? 'Encrypted message ${_labelFor(_thread)}'
-                          : 'Direct message ${_labelFor(_thread)}',
-                      helperText: _selectedPeerId == null
-                          ? 'Channel messages are signed but readable'
-                          : (_chat?.groups.containsKey(_thread) ?? false)
-                          ? 'Encrypted group · experimental, unreviewed'
-                          : _canEncryptToSelected
-                          ? 'Encrypted · experimental, unreviewed'
-                          : 'No key for this peer yet — sending will fail',
-                      helperStyle: TextStyle(
-                        color: _selectedPeerId != null && !_canEncryptToSelected
-                            ? Theme.of(context).colorScheme.error
-                            : null,
+            Expanded(
+              child: ListView.builder(
+                padding: const EdgeInsets.all(12),
+                itemCount: _visibleMessages.length,
+                itemBuilder: (context, index) {
+                  final message = _visibleMessages[index];
+                  final state = _states[message.id];
+                  return Align(
+                    alignment: message.isLocal
+                        ? Alignment.centerRight
+                        : Alignment.centerLeft,
+                    child: Card(
+                      color: message.isLocal
+                          ? Theme.of(context).colorScheme.primaryContainer
+                          : null,
+                      child: Padding(
+                        padding: const EdgeInsets.all(10),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              state == null
+                                  ? message.senderId
+                                  : '${message.senderId} · ${state.name}',
+                              style: Theme.of(context).textTheme.labelSmall,
+                            ),
+                            // Remote text is untrusted: invisible characters
+                            // can hide content from the reader.
+                            Text(
+                              message.isLocal
+                                  ? message.text
+                                  : UntrustedText.stripHidden(message.text),
+                            ),
+                            if (!message.isLocal && message.hasHiddenCharacters)
+                              Text(
+                                'Hidden characters removed',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: Theme.of(context).colorScheme.error,
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _text,
+                      enabled: _running,
+                      onSubmitted: (_) => _send(),
+                      decoration: InputDecoration(
+                        border: const OutlineInputBorder(),
+                        hintText: _selectedPeerId == null
+                            ? 'Message #$_generalChannel'
+                            : (_chat?.groups.containsKey(_thread) ?? false)
+                            ? 'Encrypted message ${_labelFor(_thread)}'
+                            : 'Direct message ${_labelFor(_thread)}',
+                        helperText: _selectedPeerId == null
+                            ? 'Channel messages are signed but readable'
+                            : (_chat?.groups.containsKey(_thread) ?? false)
+                            ? 'Encrypted group · experimental, unreviewed'
+                            : _canEncryptToSelected
+                            ? 'Encrypted · experimental, unreviewed'
+                            : 'No key for this peer yet — sending will fail',
+                        helperStyle: TextStyle(
+                          color:
+                              _selectedPeerId != null && !_canEncryptToSelected
+                              ? Theme.of(context).colorScheme.error
+                              : null,
+                        ),
                       ),
                     ),
                   ),
-                ),
-                IconButton.filled(
-                  onPressed: _running ? _send : null,
-                  icon: const Icon(Icons.send),
+                  IconButton.filled(
+                    onPressed: _running ? _send : null,
+                    icon: const Icon(Icons.send),
+                  ),
+                ],
+              ),
+            ),
+            ExpansionTile(
+              title: const Text('Diagnostics'),
+              children: [
+                SizedBox(
+                  height: 120,
+                  child: ListView(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    children: [
+                      for (final entry in _log)
+                        Text(
+                          entry,
+                          style: const TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 11,
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
               ],
             ),
-          ),
-          ExpansionTile(
-            title: const Text('Diagnostics'),
-            children: [
-              SizedBox(
-                height: 120,
-                child: ListView(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  children: [
-                    for (final entry in _log)
-                      Text(
-                        entry,
-                        style: const TextStyle(
-                          fontFamily: 'monospace',
-                          fontSize: 11,
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
+}
+
+/// Bridging choices, persisted beside the message log.
+class _BridgeSettings {
+  const _BridgeSettings({
+    this.consent = false,
+    this.gateway = false,
+    this.allowMetered = false,
+    this.allowRoaming = false,
+    this.metered = false,
+    this.roaming = false,
+  });
+
+  final bool consent;
+  final bool gateway;
+  final bool allowMetered;
+  final bool allowRoaming;
+  final bool metered;
+  final bool roaming;
+
+  BridgePolicy? get policy => gateway
+      ? BridgePolicy(allowMetered: allowMetered, allowRoaming: allowRoaming)
+      : null;
+
+  NetworkConditions get conditions =>
+      NetworkConditions(metered: metered, roaming: roaming);
+
+  _BridgeSettings copyWith({
+    bool? consent,
+    bool? gateway,
+    bool? allowMetered,
+    bool? allowRoaming,
+    bool? metered,
+    bool? roaming,
+  }) => _BridgeSettings(
+    consent: consent ?? this.consent,
+    gateway: gateway ?? this.gateway,
+    allowMetered: allowMetered ?? this.allowMetered,
+    allowRoaming: allowRoaming ?? this.allowRoaming,
+    metered: metered ?? this.metered,
+    roaming: roaming ?? this.roaming,
+  );
+
+  static Future<_BridgeSettings> load(File file) async {
+    if (!await file.exists()) return const _BridgeSettings();
+    try {
+      final json =
+          jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      bool flag(String key) => json[key] == true;
+      return _BridgeSettings(
+        consent: flag('consent'),
+        gateway: flag('gateway'),
+        allowMetered: flag('allowMetered'),
+        allowRoaming: flag('allowRoaming'),
+        metered: flag('metered'),
+        roaming: flag('roaming'),
+      );
+    } on Object {
+      // Unreadable settings fall back to everything off.
+      return const _BridgeSettings();
+    }
+  }
+
+  Future<void> save(File file) => file.writeAsString(
+    jsonEncode({
+      'consent': consent,
+      'gateway': gateway,
+      'allowMetered': allowMetered,
+      'allowRoaming': allowRoaming,
+      'metered': metered,
+      'roaming': roaming,
+    }),
+    flush: true,
+  );
 }

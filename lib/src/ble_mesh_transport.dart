@@ -38,6 +38,10 @@ class BleMeshUuids {
 /// Events arrive on one ordered channel, so a frame can never be delivered
 /// before the [linkUp] for its own link.
 class BleMeshTransport {
+  /// Creates a transport and subscribes to platform events immediately.
+  ///
+  /// [api] defaults to the Pigeon platform channel; pass a fake in tests.
+  /// Call [dispose] when done to release the subscription and streams.
   BleMeshTransport({BlePlatformApi? api})
     : _api = api ?? PigeonBlePlatformApi() {
     _events = _api.events().listen(_onEvent, onError: _onEventError);
@@ -59,22 +63,37 @@ class BleMeshTransport {
   bool _running = false;
   bool _disposed = false;
 
+  /// Adapter states as the platform reports them. Broadcast.
+  ///
+  /// Emits [BleAdapterState.unsupported] once if the platform has no plugin.
+  /// See [lastAdapterState] for the value before you subscribed.
   Stream<BleAdapterState> get adapterState => _adapterState.stream;
 
+  /// Links as they come up, each already added to [links]. Broadcast.
   Stream<BleLink> get linkUp => _linkUp.stream;
 
+  /// Links as they go down, each already removed from [links]. Broadcast.
+  ///
+  /// Not emitted for links cleared by [stop] or by the adapter powering off
+  /// or losing authorization; watch [linksChanged] for those.
   Stream<BleLinkDown> get linkDown => _linkDown.stream;
 
+  /// Frames received from peers, in arrival order. Broadcast.
   Stream<BleFrame> get frames => _frames.stream;
 
+  /// Asynchronous platform errors and event channel failures. Broadcast.
+  ///
+  /// Errors from a call such as [send] are thrown by that call instead.
   Stream<BleTransportError> get errors => _errors.stream;
 
   /// Emitted whenever the live link set changes, for UI that shows neighbours.
+  /// Broadcast; each event is the full list of live links.
   Stream<List<BleLink>> get linksChanged => _linksChanged.stream;
 
   /// Last adapter state the platform reported.
   BleAdapterState get lastAdapterState => _lastAdapterState;
 
+  /// Whether [start] has succeeded and [stop] has not been called since.
   bool get isRunning => _running;
 
   /// Live links, keyed by link id. Snapshot; safe to hold.
@@ -91,6 +110,10 @@ class BleMeshTransport {
             .map((link) => link.maxFrameSize)
             .reduce((a, b) => a < b ? a : b);
 
+  /// Reports which BLE roles this device supports.
+  ///
+  /// On a platform without the plugin, completes with both roles unsupported
+  /// and `platformName` `'unsupported'` rather than throwing.
   Future<BleCapabilities> capabilities() => _guard(
     () => _api.capabilities(),
     onUnsupported: () => BleCapabilities(
@@ -100,11 +123,18 @@ class BleMeshTransport {
     ),
   );
 
+  /// Queries the adapter state now, and completes with
+  /// [BleAdapterState.unsupported] on a platform without the plugin.
   Future<BleAdapterState> currentAdapterState() => _guard(
     () => _api.adapterState(),
     onUnsupported: () => BleAdapterState.unsupported,
   );
 
+  /// Requests the runtime permissions the transport needs and completes with
+  /// the outcome.
+  ///
+  /// Completes with [BlePermissionState.notRequired] on a platform without
+  /// the plugin.
   Future<BlePermissionState> requestPermissions() => _guard(
     () => _api.requestPermissions(),
     onUnsupported: () => BlePermissionState.notRequired,
@@ -125,6 +155,10 @@ class BleMeshTransport {
     ));
   }
 
+  /// Stops advertising, the GATT server, and scanning, and forgets all links.
+  ///
+  /// Emits an empty [linksChanged] list when links were live. Does nothing on
+  /// a platform without the plugin. Throws [StateError] after [dispose].
   Future<void> stop() async {
     _assertUsable();
     await _guard(() async {
@@ -187,6 +221,11 @@ class BleMeshTransport {
     return BleBroadcastReport(delivered: delivered, failed: failed);
   }
 
+  /// Asks the platform to drop [linkId].
+  ///
+  /// The link leaves [links] when the platform reports it on [linkDown].
+  /// Does nothing on a platform without the plugin. Throws [StateError] after
+  /// [dispose].
   Future<void> disconnect(String linkId) async {
     _assertUsable();
     await _guard(() => _api.disconnect(linkId), onUnsupported: () {});
@@ -208,6 +247,11 @@ class BleMeshTransport {
     return platformLinks;
   }
 
+  /// Cancels the platform subscription and closes every stream.
+  ///
+  /// Safe to call more than once. Does not stop the radios; call [stop]
+  /// first. Afterwards, [start], [stop], [send], [broadcast], and
+  /// [disconnect] throw [StateError].
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;

@@ -10,6 +10,7 @@ import 'chat_keys.dart';
 /// Deliberately carries no detail about which check failed: telling a caller
 /// whether the signature or the tag was wrong hands an attacker an oracle.
 class MessageSecurityException implements Exception {
+  /// Creates an exception with a coarse, loggable [reason].
   const MessageSecurityException(this.reason);
 
   /// A coarse category, safe to log. Never the offending bytes.
@@ -22,14 +23,21 @@ class MessageSecurityException implements Exception {
 /// A verified signing identity advertised a different agreement key.
 /// Hosts may show a fingerprint comparison before explicitly accepting it.
 class PeerKeyChangedException extends MessageSecurityException {
+  /// Creates an exception for [peerId] advertising [proposedKeys].
   const PeerKeyChangedException(this.peerId, this.proposedKeys)
     : super('peer key changed');
+
+  /// Peer id whose pinned agreement key differs from the advertised one.
   final String peerId;
+
+  /// Public keys the peer now advertises. Public material only; accept them
+  /// only after an out-of-band comparison.
   final ChatPublicKeys proposedKeys;
 }
 
 /// Sealed payload produced by [MessageCipher.encrypt].
 class SealedPayload {
+  /// Creates a payload from its already-split components.
   const SealedPayload({
     required this.ephemeralPublicKey,
     required this.nonce,
@@ -37,11 +45,20 @@ class SealedPayload {
     required this.mac,
   });
 
+  /// Sender's per-message X25519 public key, 32 bytes.
   final Uint8List ephemeralPublicKey;
+
+  /// XChaCha20 nonce, 24 bytes.
   final Uint8List nonce;
+
+  /// Encrypted content, without the authentication tag.
   final Uint8List ciphertext;
+
+  /// Poly1305 authentication tag, 16 bytes.
   final Uint8List mac;
 
+  /// Wire form: `ephemeralPublicKey || nonce || mac || len || ciphertext`,
+  /// where `len` is the ciphertext length as a big-endian uint32.
   Uint8List encode() {
     final builder = BytesBuilder()
       ..add(ephemeralPublicKey)
@@ -54,6 +71,13 @@ class SealedPayload {
     return builder.toBytes();
   }
 
+  /// Splits bytes produced by [encode].
+  ///
+  /// Only the layout is checked; the result is unauthenticated until
+  /// decryption succeeds. Throws [MessageSecurityException] (`malformed`) if
+  /// the input is shorter than the 76-byte header or the length prefix does
+  /// not match the remaining bytes. The returned fields are views into
+  /// [bytes], not copies.
   static SealedPayload decode(Uint8List bytes) {
     const header = 32 + 24 + 16 + 4;
     if (bytes.length < header) {
@@ -76,7 +100,7 @@ class SealedPayload {
 /// Extension seam for message confidentiality.
 ///
 /// Implementing this is not permission to ship an unreviewed cipher. The
-/// default suite is documented in `docs/CRYPTO.md`.
+/// default suite is documented in `doc/CRYPTO.md`.
 abstract interface class MessageCipher {
   /// Identifier recorded on the wire so a future suite can coexist.
   String get suiteId;
@@ -106,6 +130,7 @@ abstract interface class MessageCipher {
 /// be asleep, out of range, or hours away behind a relay when the packet is
 /// created.
 class SealedMessageCipher implements MessageCipher {
+  /// Creates the default cipher. It holds no state.
   const SealedMessageCipher();
 
   @override

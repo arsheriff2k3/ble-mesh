@@ -6,12 +6,17 @@ import 'chat_models.dart';
 /// Rejecting is deliberate: silently dropping an older message to make room
 /// would let a burst erase history the user believes is still pending.
 class MessageStoreFullException implements Exception {
+  /// Creates an exception reporting the queue size against its quota.
   const MessageStoreFullException({
     required this.queuedPackets,
     required this.maximumQueuedPackets,
   });
 
+  /// Packets held in the queue when the packet was rejected, including
+  /// expired ones not yet removed.
   final int queuedPackets;
+
+  /// The store's quota of unexpired queued packets.
   final int maximumQueuedPackets;
 
   @override
@@ -22,8 +27,11 @@ class MessageStoreFullException implements Exception {
 
 /// Thrown rather than forgetting an unexpired packet id and admitting replay.
 class SeenPacketQuotaException implements Exception {
+  /// Creates an exception for a store whose seen-id quota is
+  /// [maximumSeenPackets].
   const SeenPacketQuotaException(this.maximumSeenPackets);
 
+  /// The store's quota of unexpired packet ids.
   final int maximumSeenPackets;
 
   @override
@@ -33,12 +41,16 @@ class SeenPacketQuotaException implements Exception {
 
 /// Thrown when a store's on-disk format is newer than this build understands.
 class MessageStoreVersionException implements Exception {
+  /// Creates an exception for a store at version [found].
   const MessageStoreVersionException({
     required this.found,
     required this.supported,
   });
 
+  /// Format version recorded in the store.
   final int found;
+
+  /// Newest format version this build can read.
   final int supported;
 
   @override
@@ -98,6 +110,8 @@ abstract interface class MessageStore {
 /// Volatile store. Everything is lost when the process exits, which makes it
 /// the right default for tests and for hosts that do not want history on disk.
 class InMemoryMessageStore implements MessageStore {
+  /// Creates an empty store. [clock] defaults to [DateTime.now] and decides
+  /// expiry; it exists for tests.
   InMemoryMessageStore({
     this.maximumQueuedPackets = 1024,
     this.maximumMessages = 4096,
@@ -105,8 +119,16 @@ class InMemoryMessageStore implements MessageStore {
     DateTime Function()? clock,
   }) : _clock = clock ?? DateTime.now;
 
+  /// Most unexpired packets [enqueue] accepts before throwing
+  /// [MessageStoreFullException]. Defaults to 1024.
   final int maximumQueuedPackets;
+
+  /// Most messages retained; saving beyond this evicts the oldest. Defaults
+  /// to 4096.
   final int maximumMessages;
+
+  /// Most unexpired packet ids [rememberSeen] retains before throwing
+  /// [SeenPacketQuotaException]. Defaults to 65536.
   final int maximumSeenPackets;
   final DateTime Function() _clock;
 
@@ -200,10 +222,19 @@ class InMemoryMessageStore implements MessageStore {
   }
 }
 
+/// Bounded in-memory set of recently seen packet ids, each kept until it
+/// expires.
+///
+/// Unlike [MessageStore.rememberSeen], a full cache evicts its oldest entry
+/// instead of refusing, so it is a fast first filter rather than the durable
+/// replay record.
 class DedupeCache {
+  /// Creates an empty cache. [clock] defaults to [DateTime.now] and decides
+  /// expiry; it exists for tests.
   DedupeCache({this.maximumEntries = 4096, DateTime Function()? clock})
     : _clock = clock ?? DateTime.now;
 
+  /// Most ids held at once. Defaults to 4096.
   final int maximumEntries;
   final DateTime Function() _clock;
   final Map<String, DateTime> _entries = {};
@@ -216,6 +247,11 @@ class DedupeCache {
     }
   }
 
+  /// Records [packetId] until [expiresAt] and returns true, or returns false
+  /// when it is already held and unexpired.
+  ///
+  /// Expired entries are purged first; when the cache is still full the
+  /// oldest entries are evicted to make room.
   bool remember(String packetId, DateTime expiresAt) {
     final now = _clock();
     _entries.removeWhere((_, expiry) => !expiry.isAfter(now));

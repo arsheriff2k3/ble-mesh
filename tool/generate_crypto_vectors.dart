@@ -1,9 +1,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:ble_mesh/src/chat/chat_models.dart';
-import 'package:ble_mesh/src/chat/crypto/chat_keys.dart';
-import 'package:ble_mesh/src/chat/packet_codec.dart';
+import 'package:ble_mesh_chat/src/chat/chat_models.dart';
+import 'package:ble_mesh_chat/src/chat/crypto/chat_keys.dart';
+import 'package:ble_mesh_chat/src/chat/packet_codec.dart';
 import 'package:cryptography/cryptography.dart';
 
 Future<void> main() async {
@@ -23,7 +23,7 @@ Future<void> main() async {
     ttl: 5,
     createdAt: DateTime.fromMillisecondsSinceEpoch(1700000000000, isUtc: true),
     expiresAt: DateTime.fromMillisecondsSinceEpoch(1700003600000, isUtc: true),
-    payload: Uint8List.fromList(utf8.encode('Phase 3 vector')),
+    payload: Uint8List.fromList(utf8.encode('test vector')),
   ).withSenderKeys(alice.publicKeys);
   final signingInput = packet.signingInput;
   final signature = await Ed25519().sign(
@@ -66,7 +66,7 @@ Future<void> main() async {
     ttl: 5,
     createdAt: DateTime.fromMillisecondsSinceEpoch(1700000000000, isUtc: true),
     expiresAt: DateTime.fromMillisecondsSinceEpoch(1700003600000, isUtc: true),
-    payload: Uint8List.fromList(utf8.encode('Phase 3 vector')),
+    payload: Uint8List.fromList(utf8.encode('test vector')),
   ).withSenderKeys(alice.publicKeys);
   final groupKey = List<int>.generate(32, (i) => 192 + i);
   final groupNonce = List<int>.generate(24, (i) => 48 + i);
