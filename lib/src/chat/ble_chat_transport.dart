@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 
 import '../ble_api.g.dart';
 import '../ble_mesh_transport.dart';
@@ -61,7 +62,7 @@ class BleChatTransport implements ChatTransport {
   final BleConfig? config;
 
   /// When a peer has several links, one authenticated this much longer ago
-  /// than its newest is presumed dead. A peer that restarts leaves its old
+  /// than its newest is deprioritized. A peer that restarts leaves its old
   /// connection half-open on this side, and keeping that one instead of the
   /// fresh link would strand every message to it.
   final Duration staleLinkAge;
@@ -124,6 +125,9 @@ class BleChatTransport implements ChatTransport {
   /// Frames sent on it directly skip packet encoding, fragmentation, and
   /// [security].
   BleMeshTransport get rawTransport => _ble;
+
+  /// Peers authenticated on live direct links, excluding mesh advertisements.
+  Set<String> get directPeerIds => Set.unmodifiable(_peerByLink.values);
 
   @override
   Future<void> start() async {
@@ -226,6 +230,12 @@ class BleChatTransport implements ChatTransport {
     final handshake =
         packet.type == ChatPacketType.linkChallenge ||
         packet.type == ChatPacketType.announce;
+    // A peripheral may subscribe before its MTU callback arrives. The native
+    // registry knows the new size; refresh a minimum-MTU cache before files.
+    if (packet.type == ChatPacketType.fileTransfer &&
+        _ble.links.values.any((link) => link.maxFrameSize <= 20)) {
+      await _ble.refreshLinks();
+    }
     final targets =
         (routeId == null
                 ? _ble.links.values
@@ -238,20 +248,50 @@ class BleChatTransport implements ChatTransport {
                   handshake ||
                   _peerByLink.containsKey(link.linkId),
             )
+            .where(
+              (link) =>
+                  packet.type != ChatPacketType.fileTransfer ||
+                  (security != null &&
+                      packet.destination == 'p:${_peerByLink[link.linkId]}'),
+            )
             .toList();
+    if (!handshake) _rankLinks(targets);
     var delivered = 0;
+    var attempted = 0;
+    final sentPeers = <String>{};
     final encoded = codec.encode(packet);
     for (final link in targets) {
+      final peer = _peerByLink[link.linkId];
+      if (!handshake && peer != null && sentPeers.contains(peer)) continue;
+      attempted++;
       try {
+        final clock = Stopwatch()..start();
         final fragments = fragmenter.fragment(
           packet.packetId,
           encoded,
-          link.maxFrameSize,
+          link.maxFrameSize.clamp(20, 512),
         );
-        for (final fragment in fragments) {
-          await _ble.send(link.linkId, fragment);
+        // Keep a bounded native queue populated so each GATT completion can
+        // immediately submit the next frame. Native still serializes actual
+        // radio operations; every queued completion is awaited, including errors.
+        const window = 4;
+        for (var index = 0; index < fragments.length; index += window) {
+          final end = (index + window).clamp(0, fragments.length);
+          await Future.wait([
+            for (var next = index; next < end; next++)
+              _writeFragment(link.linkId, fragments[next]),
+          ]);
+        }
+        if (kDebugMode &&
+            packet.type == ChatPacketType.fileTransfer &&
+            encoded.length > 1024) {
+          debugPrint(
+            'BLE file packet: ${encoded.length} bytes, ${fragments.length} frames, '
+            'frame limit ${link.maxFrameSize.clamp(20, 512)}, ${clock.elapsedMilliseconds} ms',
+          );
         }
         delivered++;
+        if (peer != null) sentPeers.add(peer);
       } catch (error) {
         // A link that vanished mid-send is ordinary mesh behaviour, not a
         // fault worth showing: the route simply does not count as delivered
@@ -269,7 +309,7 @@ class BleChatTransport implements ChatTransport {
       }
     }
     return ChatTransportSendResult(
-      attemptedRoutes: targets.length,
+      attemptedRoutes: attempted,
       deliveredRoutes: delivered,
     );
   }
@@ -284,6 +324,29 @@ class BleChatTransport implements ChatTransport {
 
   static bool _isDeadLink(Object error) =>
       error is PlatformException && error.code == 'write_failed';
+
+  Future<void> _writeFragment(String linkId, Uint8List fragment) async {
+    for (var attempt = 0; ; attempt++) {
+      try {
+        await _ble.send(linkId, fragment);
+        return;
+      } on PlatformException catch (error) {
+        // An immediate refusal means this frame was never queued by Android.
+        // Allow its busy GATT stack to settle without tearing down a good link.
+        // Callback failures/timeouts may have sent bytes, so are not retried here.
+        if (error.code != 'write_failed' ||
+            !(error.message?.contains('was refused by the platform') ??
+                false) ||
+            attempt >= 3) {
+          rethrow;
+        }
+        await Future<void>.delayed(Duration(milliseconds: 30 << attempt));
+        if (!_started || !_ble.links.containsKey(linkId)) {
+          throw BleUnknownLinkException(linkId);
+        }
+      }
+    }
+  }
 
   /// Forgets everything known about [linkId]'s connection.
   void _forgetLink(String linkId) {
@@ -458,6 +521,16 @@ class BleChatTransport implements ChatTransport {
           if (security != null && !_peerByLink.containsKey(frame.linkId)) {
             return;
           }
+          // Attachments never travel through a mesh intermediary. Require the
+          // packet origin to be the authenticated peer on this physical link.
+          if (packet.type == ChatPacketType.fileTransfer &&
+              (security == null ||
+                  _peerByLink[frame.linkId] != packet.senderId ||
+                  packet.ttl != 1 ||
+                  packet.bridgeable ||
+                  !packet.isSealed)) {
+            return;
+          }
           if (packet.type == ChatPacketType.peerAdvertisement) {
             if (security != null) await _onAdvertisement(frame.linkId, packet);
             return;
@@ -497,7 +570,6 @@ class BleChatTransport implements ChatTransport {
       _peerByLink[linkId] = packet.senderId;
       _authenticatedAt[linkId] = DateTime.now();
       _nameByPeer[packet.senderId] = _decodeName(packet.payload);
-      await _suppressDuplicateLinks(packet.senderId);
       _publishPeers();
       return;
     }
@@ -534,7 +606,6 @@ class BleChatTransport implements ChatTransport {
     _nameByPeer[packet.senderId] = _decodeName(
       Uint8List.sublistView(packet.payload, 96),
     );
-    await _suppressDuplicateLinks(packet.senderId);
     _publishPeers();
     // Share cached, still-valid discovery records with a newly joined peer.
     for (final cached in _advertisements.values.toList()) {
@@ -623,44 +694,36 @@ class BleChatTransport implements ChatTransport {
 
   /// Keeps one link per peer.
   ///
-  /// Links authenticated more than [staleLinkAge] before the peer's newest
-  /// are dropped first: they are most likely left over from before the
-  /// peer restarted. Among the rest, both sides make the same choice
-  /// independently: the lower peer id keeps its central link, the higher its
-  /// peripheral link, and link id breaks ties.
-  Future<void> _suppressDuplicateLinks(String peerId) async {
-    final candidates = _peerByLink.entries
-        .where((entry) => entry.value == peerId)
-        .map((entry) => _ble.links[entry.key])
-        .whereType<BleLink>()
-        .toList();
-    if (candidates.length < 2) return;
+  /// Keep both physical roles alive. Disconnecting a duplicate can tear down
+  /// Android's shared connection/subscription and strand the surviving route.
+  /// Prefer one authenticated route per peer for sends, retaining the other
+  /// for incoming traffic and immediate fallback on a failed write.
+  void _rankLinks(List<BleLink> links) {
     final epoch = DateTime.fromMillisecondsSinceEpoch(0);
     DateTime authenticatedAt(BleLink link) =>
         _authenticatedAt[link.linkId] ?? epoch;
-    final newest = candidates
-        .map(authenticatedAt)
-        .reduce((a, b) => a.isAfter(b) ? a : b);
-    final stale = candidates
-        .where(
-          (link) => newest.difference(authenticatedAt(link)) > staleLinkAge,
-        )
-        .toList();
-    final fresh = candidates.where((link) => !stale.contains(link)).toList();
-    final desiredRole = identity.peerId.compareTo(peerId) < 0
-        ? BleLinkRole.central
-        : BleLinkRole.peripheral;
-    fresh.sort((a, b) {
-      final aPreferred = a.role == desiredRole ? 0 : 1;
-      final bPreferred = b.role == desiredRole ? 0 : 1;
-      final roleOrder = aPreferred.compareTo(bPreferred);
-      return roleOrder != 0 ? roleOrder : a.linkId.compareTo(b.linkId);
-    });
-    for (final duplicate in [...stale, ...fresh.skip(1)]) {
-      _forgetLink(duplicate.linkId);
-      await _ble.disconnect(duplicate.linkId);
+    final newest = <String, DateTime>{};
+    for (final link in links) {
+      final peer = _peerByLink[link.linkId];
+      if (peer == null) continue;
+      final at = authenticatedAt(link);
+      if (newest[peer] == null || at.isAfter(newest[peer]!)) newest[peer] = at;
     }
-    _publishPeers();
+    int rank(BleLink link) {
+      final peer = _peerByLink[link.linkId];
+      if (peer == null) return 0;
+      final stale =
+          newest[peer]!.difference(authenticatedAt(link)) > staleLinkAge;
+      final desired = identity.peerId.compareTo(peer) < 0
+          ? BleLinkRole.central
+          : BleLinkRole.peripheral;
+      return (stale ? 2 : 0) + (link.role == desired ? 0 : 1);
+    }
+
+    links.sort((a, b) {
+      final order = rank(a).compareTo(rank(b));
+      return order != 0 ? order : a.linkId.compareTo(b.linkId);
+    });
   }
 
   void _publishAvailability() {

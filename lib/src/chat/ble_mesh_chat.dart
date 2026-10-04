@@ -54,10 +54,12 @@ class BleMeshChat {
       perSecond: 20,
     ),
     this.contactsOnlyTransports = const {'nostr'},
+    Set<String> publicInternetChannels = const {},
     bool bridgeConsent = false,
     BridgePolicy? bridgePolicy,
     this.bridgeRegistrationInterval = const Duration(minutes: 4),
   }) : assert(messageLifetime <= maximumPacketLifetime),
+       publicInternetChannels = Set.unmodifiable(publicInternetChannels),
        // Mutable after construction, so not initializing formals.
        // ignore: prefer_initializing_formals
        _bridgeConsent = bridgeConsent,
@@ -138,6 +140,10 @@ class BleMeshChat {
   /// a peer id can reach it there, and fresh identities cost nothing.
   final Set<String> contactsOnlyTransports;
 
+  /// Explicitly allowed public, signed but unencrypted internet channels.
+  /// Empty by default. Direct-message contact policy remains unchanged.
+  final Set<String> publicInternetChannels;
+
   /// Budgets per authenticated sender, and per arrival route (a BLE link or
   /// a relay). The route budget also bounds swarms of fresh identities.
   final TokenBuckets _senderBuckets;
@@ -193,6 +199,7 @@ class BleMeshChat {
   List<ChatTransport> _transports = const [];
   ChatIdentity? _identity;
   bool _initialized = false;
+  bool _disposing = false;
   bool _flushing = false;
 
   /// Messages sent by this device, messages received for it, and, during
@@ -314,23 +321,23 @@ class BleMeshChat {
     _transports = List.unmodifiable(transports);
     for (final transport in _transports) {
       _subscriptions.addAll([
-        transport.incoming.listen(_enqueueInbound, onError: _errors.add),
+        transport.incoming.listen(_enqueueInbound, onError: _reportError),
         transport.availabilityChanges.listen((available) {
           if (available) unawaited(_flushQueue());
           _refreshBridge();
           if (available && transport is! RelayChatTransport) {
             unawaited(_sendRegistration());
           }
-        }, onError: _errors.add),
+        }, onError: _reportError),
         transport.peers.listen(
           (peers) => _updatePeers(transport.id, peers),
-          onError: _errors.add,
+          onError: _reportError,
         ),
       ]);
       try {
         await transport.start();
       } on Object catch (error) {
-        _errors.add(error);
+        _reportError(error);
       }
     }
     _bridgeTimer = Timer.periodic(bridgeRegistrationInterval, (_) {
@@ -662,7 +669,7 @@ class BleMeshChat {
       }
     } on Object catch (error) {
       // A store we cannot read must not stop the app from chatting now.
-      _errors.add(error);
+      _reportError(error);
     }
   }
 
@@ -670,6 +677,7 @@ class BleMeshChat {
     ChatPacket packet, {
     bool emitSending = false,
   }) async {
+    if (_disposing) return false;
     if (packet.type == ChatPacketType.groupMessage) {
       final group = packet.destination.startsWith('g:')
           ? _groups[packet.destination.substring(2)]
@@ -719,12 +727,14 @@ class BleMeshChat {
       for (final transport in transports) {
         try {
           final result = await transport.send(packet);
+          if (_disposing) return false;
           deliveredRoutes += result.deliveredRoutes;
         } on Object catch (error) {
-          _errors.add(error);
+          _reportError(error);
         }
       }
     }
+    if (_disposing) return false;
     if (_acknowledgedPacketIds.containsKey(packet.id)) return true;
     final requiresAck =
         packet.destination.startsWith('p:') &&
@@ -761,7 +771,7 @@ class BleMeshChat {
     } on Object catch (error) {
       // A full or unwritable store must produce an honest failure rather than
       // a message the user believes is still on its way.
-      _errors.add(error);
+      _reportError(error);
       if (packet.type == ChatPacketType.message ||
           packet.type == ChatPacketType.groupMessage) {
         _emitState(packet.id, MessageState.failed, error);
@@ -802,6 +812,7 @@ class BleMeshChat {
     ReceivedChatPacket received, {
     bool replayGroup = false,
   }) {
+    if (received.packet.type == ChatPacketType.fileTransfer) return;
     if (!_initialized || _pendingInbound >= maximumPendingInbound) return;
     // Spend the route budget before any signature work, so a neighbour
     // cannot make us burn CPU faster than it is allowed to send.
@@ -816,7 +827,7 @@ class BleMeshChat {
     _inboundWork = _inboundWork
         .then((_) => _onPacket(received, replayGroup: replayGroup))
         .catchError((Object error) {
-          if (!_errors.isClosed) _errors.add(error);
+          if (!_errors.isClosed) _reportError(error);
         })
         .whenComplete(() => _pendingInbound--);
   }
@@ -830,7 +841,7 @@ class BleMeshChat {
     final now = _clock();
     if (packet.isExpired(now)) return;
     if (!replayGroup && !_plausibleLifetime(packet, now)) {
-      _errors.add(
+      _reportError(
         const MessageSecurityException('implausible packet lifetime'),
       );
       return;
@@ -839,7 +850,18 @@ class BleMeshChat {
     final keyed = security;
     final directForUsEarly = packet.destination == 'p:${identity.peerId}';
     final arrivedOnline = _isOnline(received.transportId);
-    if (arrivedOnline && !directForUsEarly && !_mayBridgeToLocal(packet)) {
+    final publicForUs =
+        packet.destination.startsWith('c:') &&
+        publicInternetChannels.contains(packet.destination.substring(2)) &&
+        packet.type == ChatPacketType.message &&
+        !packet.isSealed &&
+        keyed != null &&
+        packet.signature != null &&
+        packet.senderKeys != null;
+    if (arrivedOnline &&
+        !directForUsEarly &&
+        !publicForUs &&
+        !_mayBridgeToLocal(packet)) {
       // Relays only deliver others' traffic to a gateway, and only for
       // devices that registered with it.
       return;
@@ -858,7 +880,7 @@ class BleMeshChat {
           keyed.trustStore.keysFor(packet.senderId) == null) {
         // Checked before admit(), which would otherwise pin the stranger on
         // first contact. No ACK is sent, so probing learns nothing.
-        _errors.add(
+        _reportError(
           UnknownSenderException(packet.senderId, received.transportId),
         );
         return;
@@ -883,7 +905,7 @@ class BleMeshChat {
           }
         }
       } on MessageSecurityException catch (error) {
-        _errors.add(error);
+        _reportError(error);
         return;
       }
     }
@@ -909,7 +931,7 @@ class BleMeshChat {
               ByteData.sublistView(packet.payload).getUint32(0) > group.epoch) {
             _holdGroupPacket(received);
           } else {
-            _errors.add(error);
+            _reportError(error);
           }
         }
       }
@@ -919,7 +941,7 @@ class BleMeshChat {
       try {
         await _acceptGroupUpdate(packet, identity.peerId);
       } on Object catch (error) {
-        _errors.add(error);
+        _reportError(error);
         return;
       }
     }
@@ -953,7 +975,7 @@ class BleMeshChat {
     if (packet.type == ChatPacketType.acknowledgement && directForUs) {
       final acknowledgedId = utf8.decode(packet.payload, allowMalformed: true);
       if (_recipientByPacketId[acknowledgedId] != packet.senderId) {
-        _errors.add(
+        _reportError(
           const MessageSecurityException('unexpected acknowledgement'),
         );
         return;
@@ -1002,7 +1024,7 @@ class BleMeshChat {
         _messages.add(message);
         await _persist(message);
       } on FormatException catch (error) {
-        _errors.add(error);
+        _reportError(error);
         return;
       }
       if (directForUs) {
@@ -1092,7 +1114,7 @@ class BleMeshChat {
         try {
           delivered += (await transport.send(forwarded)).deliveredRoutes;
         } on Object catch (error) {
-          _errors.add(error);
+          _reportError(error);
         }
       }
     } else {
@@ -1108,7 +1130,7 @@ class BleMeshChat {
         try {
           delivered += (await online.bridge(forwarded)).deliveredRoutes;
         } on Object catch (error) {
-          _errors.add(error);
+          _reportError(error);
         }
       }
     }
@@ -1187,7 +1209,7 @@ class BleMeshChat {
       try {
         await transport.send(packet);
       } on Object catch (error) {
-        _errors.add(error);
+        _reportError(error);
       }
     }
   }
@@ -1262,7 +1284,7 @@ class BleMeshChat {
     );
     if (!_lastLimitReport.containsKey(key) && _lastLimitReport.length < 256) {
       _lastLimitReport[key] = now;
-      _errors.add(InboundRateLimitedException(key));
+      _reportError(InboundRateLimitedException(key));
     }
     return false;
   }
@@ -1291,7 +1313,7 @@ class BleMeshChat {
       try {
         await transport.send(forwarded, excludeRouteId: received.routeId);
       } on Object catch (error) {
-        _errors.add(error);
+        _reportError(error);
       }
     }
   }
@@ -1358,13 +1380,14 @@ class BleMeshChat {
   }
 
   Future<void> _flushQueue() async {
-    if (_flushing || !_initialized) return;
+    if (_flushing || !_initialized || _disposing) return;
     _flushing = true;
     try {
       await _expireQueued();
       final queued = await _store.queued();
       var failed = 0;
       for (final packet in queued) {
+        if (_disposing) return;
         if (!await _attemptSend(packet, emitSending: true)) failed++;
         // Space out a backlog so draining it is not a broadcast burst that
         // every neighbour has to absorb at once.
@@ -1372,6 +1395,7 @@ class BleMeshChat {
           await Future<void>.delayed(retrySpacing);
         }
       }
+      if (_disposing) return;
       if (failed == 0) {
         _flushFailures = 0;
         if ((await _store.queued()).isNotEmpty) _scheduleRetry();
@@ -1390,6 +1414,7 @@ class BleMeshChat {
   /// the transport claims to be available but sends keep failing, which would
   /// otherwise spin.
   void _scheduleRetry() {
+    if (_disposing) return;
     if (_retryTimer?.isActive ?? false) return;
     final exponent = _flushFailures.clamp(1, 6);
     final delay = Duration(
@@ -1428,18 +1453,23 @@ class BleMeshChat {
     _inboundWork = _inboundWork
         .then((_) => _relay(received))
         .catchError((Object error) {
-          if (!_errors.isClosed) _errors.add(error);
+          if (!_errors.isClosed) _reportError(error);
         })
         .whenComplete(() => _pendingInbound--);
   }
 
+  void _reportError(Object error) {
+    if (!_errors.isClosed && !_disposing) _errors.add(error);
+  }
+
   void _emitState(String messageId, MessageState state, [Object? error]) {
+    if (_disposing || _states.isClosed) return;
     if (_deliveredMessageIds.contains(messageId)) return;
     if (state == MessageState.delivered) _deliveredMessageIds.add(messageId);
     _states.add(
       MessageStateChange(messageId: messageId, state: state, error: error),
     );
-    unawaited(_store.saveState(messageId, state).catchError(_errors.add));
+    unawaited(_store.saveState(messageId, state).catchError(_reportError));
   }
 
   /// Writes a message to durable history, skipping ones we just replayed.
@@ -1448,7 +1478,7 @@ class BleMeshChat {
     try {
       await _store.saveMessage(message);
     } on Object catch (error) {
-      _errors.add(error);
+      _reportError(error);
     }
   }
 
@@ -1473,6 +1503,7 @@ class BleMeshChat {
   /// Do not reuse the instance afterwards: its streams are closed. The group
   /// store is not closed.
   Future<void> dispose() async {
+    _disposing = true;
     _retryTimer?.cancel();
     _retryTimer = null;
     _bridgeTimer?.cancel();

@@ -51,8 +51,9 @@ class GattQueue(
     }
 
     /** Called from the GATT callback that corresponds to the active operation. */
-    fun complete(error: Throwable? = null) {
+    fun complete(error: Throwable? = null, expectedName: String? = null) {
         val operation = active ?: return
+        if (expectedName != null && operation.name != expectedName) return
         active = null
         timedOut?.let { handler.removeCallbacks(it) }
         timedOut = null

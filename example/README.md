@@ -3,6 +3,12 @@
 A chat and diagnostics app for `ble_mesh_chat`. It uses the high-level
 `BleMeshChat` API and shows adapter, link, peer, relay, and delivery state.
 
+The paperclip opens **Offline files**: send demo PDF/PNG fixtures to a direct
+authenticated BLE peer, accept/decline on the receiver, watch progress, cancel,
+resume after interruption and inspect verified bytes. This screen exercises the
+plugin without a file picker or external viewer. See
+[file-transfer plan/API and two-phone checklist](../doc/FILE_TRANSFER.md).
+
 ```bash
 flutter run     # install on two or more physical devices
 ```

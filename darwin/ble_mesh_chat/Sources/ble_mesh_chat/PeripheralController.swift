@@ -9,12 +9,6 @@ import Foundation
 final class PeripheralController: NSObject {
   typealias Completion = (Error?) -> Void
 
-  private struct Outbound {
-    let central: CBCentral
-    let data: Data
-    let completion: Completion
-  }
-
   private let registry: LinkRegistry
   private let events: BleEventBus
 
@@ -26,10 +20,11 @@ final class PeripheralController: NSObject {
 
   private var running = false
   private var serviceAdded = false
+  private var serviceAdding = false
 
   /// One FIFO across all subscribers on purpose: `updateValue` returning false
   /// means the shared transmit queue is full, not that one central is slow.
-  private var outbound: [Outbound] = []
+  private let outbound = PendingFrameQueue<CBCentral>()
 
   init(registry: LinkRegistry, events: BleEventBus) {
     self.registry = registry
@@ -58,16 +53,16 @@ final class PeripheralController: NSObject {
   func stop() {
     running = false
     manager?.stopAdvertising()
-    if serviceAdded {
-      manager?.removeAllServices()
-      serviceAdded = false
-    }
+    manager?.removeAllServices()
+    serviceAdded = false
+    serviceAdding = false
+    characteristic = nil
     failAllQueued(reason: "transport stopped")
     dropAllLinks(reason: "transport stopped")
   }
 
   func notify(link: MeshLink, frame: Data, completion: @escaping Completion) {
-    guard manager != nil, characteristic != nil else {
+    guard running, serviceAdded, manager?.state == .poweredOn, characteristic != nil else {
       completion(BleTransportError.notReady("GATT server is not running"))
       return
     }
@@ -83,7 +78,7 @@ final class PeripheralController: NSObject {
       )
       return
     }
-    outbound.append(Outbound(central: central, data: frame, completion: completion))
+    outbound.append(peer: central, data: frame, completion: completion)
     pump()
   }
 
@@ -94,6 +89,7 @@ final class PeripheralController: NSObject {
   }
 
   func dropAllLinks(reason: String) {
+    failAllQueued(reason: reason)
     for link in registry.all() where link.role == .peripheral {
       registry.remove(id: link.linkId)
       events.linkDown(link.linkId, reason: reason)
@@ -108,6 +104,7 @@ final class PeripheralController: NSObject {
     else { return }
 
     if !serviceAdded {
+      guard !serviceAdding else { return }
       // No CCCD here: CoreBluetooth manages the client configuration
       // descriptor itself and adding one explicitly is an exception.
       let mesh = CBMutableCharacteristic(
@@ -119,8 +116,9 @@ final class PeripheralController: NSObject {
       let service = CBMutableService(type: serviceUUID, primary: true)
       service.characteristics = [mesh]
       characteristic = mesh
+      serviceAdding = true
       manager.add(service)
-      serviceAdded = true
+      return
     }
 
     if !manager.isAdvertising {
@@ -135,32 +133,19 @@ final class PeripheralController: NSObject {
   }
 
   private func pump() {
-    guard let manager, let characteristic else { return }
-    while let next = outbound.first {
-      let accepted = manager.updateValue(
-        next.data,
-        for: characteristic,
-        onSubscribedCentrals: [next.central]
-      )
-      if !accepted {
-        // Resume from peripheralManagerIsReady(toUpdateSubscribers:).
-        return
-      }
-      outbound.removeFirst()
-      next.completion(nil)
+    guard running, serviceAdded, let manager, manager.state == .poweredOn,
+      let characteristic else { return }
+    outbound.drain { central, data in
+      manager.updateValue(data, for: characteristic, onSubscribedCentrals: [central])
     }
   }
 
   private func failAllQueued(reason: String) {
-    let queued = outbound
-    outbound.removeAll()
-    for item in queued {
-      item.completion(BleTransportError.writeFailed(reason))
-    }
+    outbound.failAll(error: BleTransportError.writeFailed(reason))
   }
 
   private func registerLink(central: CBCentral) {
-    guard let config else { return }
+    guard running, serviceAdded, let config else { return }
     let remoteId = central.identifier.uuidString
     if registry.link(role: .peripheral, remoteId: remoteId) != nil { return }
     if Int64(registry.count) >= config.maxConcurrentLinks { return }
@@ -173,7 +158,10 @@ final class PeripheralController: NSObject {
   }
 
   private func dropLink(remoteId: String, reason: String) {
-    outbound.removeAll { $0.central.identifier.uuidString == remoteId }
+    outbound.fail(
+      where: { $0.identifier.uuidString == remoteId },
+      error: BleTransportError.writeFailed(reason)
+    )
     if let link = registry.remove(id: MeshLink.id(for: .peripheral, remoteId: remoteId)) {
       events.linkDown(link.linkId, reason: reason)
     }
@@ -195,6 +183,8 @@ extension PeripheralController: CBPeripheralManagerDelegate {
       dropAllLinks(reason: "advertising unavailable")
     default:
       serviceAdded = false
+      serviceAdding = false
+      characteristic = nil
       failAllQueued(reason: "bluetooth unavailable")
       dropAllLinks(reason: "bluetooth unavailable")
     }
@@ -205,10 +195,15 @@ extension PeripheralController: CBPeripheralManagerDelegate {
     didAdd service: CBService,
     error: Error?
   ) {
+    guard running, serviceAdding, service.uuid == serviceUUID else { return }
+    serviceAdding = false
     if let error {
       serviceAdded = false
       events.error(.internalError, message: "adding the mesh service failed: \(error.localizedDescription)")
+      return
     }
+    serviceAdded = true
+    publish()
   }
 
   func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
@@ -245,7 +240,8 @@ extension PeripheralController: CBPeripheralManagerDelegate {
     didReceiveWrite requests: [CBATTRequest]
   ) {
     for request in requests {
-      guard let value = request.value else { continue }
+      guard running, serviceAdded, request.characteristic.uuid == characteristicUUID,
+        request.offset == 0, let value = request.value else { continue }
       let remoteId = request.central.identifier.uuidString
       guard let link = registry.link(role: .peripheral, remoteId: remoteId) else {
         // Legal but useless to us: with no subscription we could not reply.
@@ -274,6 +270,7 @@ extension PeripheralController: CBPeripheralManagerDelegate {
     // advertising a second copy of it.
     for service in services where service.uuid == serviceUUID {
       serviceAdded = true
+      serviceAdding = false
       characteristic =
         service.characteristics?.first { $0.uuid == characteristicUUID } as? CBMutableCharacteristic
     }

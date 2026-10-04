@@ -279,11 +279,15 @@ default).
   package, which is pure Dart and not constant-time. With single-use
   envelope keys, a timing leak does not expose a long-lived secret. The
   suite checks BIP-340 vector 0 against the published value.
-- **Only signed, originated, direct packets.** The transport publishes a
+- **Only signed, originated packets.** By default the transport publishes a
   packet only when this device created it, it is addressed to a peer (`p:`),
-  and it is signed. Inbound events must pass the event signature, kind, route
+  and it is signed. Explicit `publicChannels` opt into unencrypted public text
+  publication and subscriptions; the facade must also opt into those channels
+  with `publicInternetChannels`. Public senders are verified without pinning
+  them as contacts. Inbound events must pass the event signature, kind, route
   tag, and size checks. Their packet id must match the `d` tag, and the packet
-  must be signed and addressed to this device. Anything else is reported on
+  must be signed and addressed to this device or an opted-in public channel.
+  Anything else is reported on
   `errors` and dropped.
 - **Bridging needs signed consent.** The facade relays a packet only on the
   transport it arrived on. The Nostr transport republishes another

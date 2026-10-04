@@ -15,6 +15,9 @@ consenting gateway phone.
   recipient acknowledges, and replay protection that survives restarts.
 - **Online delivery:** encrypted direct messages over one or more Nostr
   relays.
+- **Offline attachments:** consent-based encrypted direct BLE sharing of small
+  images, videos, PDFs and Word documents, with progress, retries and restart resume.
+  See the [file-transfer plan and API](doc/FILE_TRANSFER.md).
 - **Bridging:** opt-in gateways that carry consenting traffic between BLE and
   Nostr.
 - **Abuse resistance:** rate budgets, contacts-only online delivery, a
@@ -142,6 +145,11 @@ A few things to know:
   `delivered` means the recipient's signed acknowledgement arrived.
 - **Online contacts only.** Nostr accepts messages from contacts only by
   default (`contactsOnlyTransports`).
+- **Public internet channels** require the same channel names in
+  `NostrChatTransport(publicChannels: {'your-room'})` and
+  `BleMeshChat(publicInternetChannels: {'your-room'})`. Both default to empty.
+  These channels carry signed, unencrypted text that anyone can read. They do
+  not enroll senders as private contacts or bridge traffic automatically.
 - **Bridging** is off unless the sender sets `bridgeConsent` and a gateway
   sets a `BridgePolicy`. See [doc/BRIDGE.md](doc/BRIDGE.md).
 - `example/` is a complete harness covering all of the above.

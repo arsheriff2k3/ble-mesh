@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- Hardened iOS/macOS CoreBluetooth startup and shutdown: advertise only after
+  service publication, fail pending notifications on subscriber disconnect,
+  stop late connection callbacks, cancel scan/connect timers on radio loss,
+  and wait for a definite adapter state during the permission prompt.
+- Include the plugin privacy manifest in Swift Package Manager builds and
+  align the CocoaPods version with 0.1.2. Shared Dart attachment protocols work
+  unchanged across Android and iOS.
+
+- Keep both authenticated BLE roles connected instead of disconnecting a
+  duplicate physical link. Send once per peer using the preferred fresh route,
+  falling back to the other role when a write fails. This avoids disrupting a
+  shared Android GATT connection/subscription during duplicate cleanup.
+
+- Added HEIF/HEIC still-image attachments (`image/heif`, `image/heic`) with
+  the same 5 MiB limit as JPEG/PNG. Transfer preserves original bytes.
+
+- Added MP4, MOV and WebM video attachments with a 5 MiB default limit
+  (`maximumVideoBytes`), using the same consent, resume and integrity protocol.
+
+- Increased JPEG/PNG attachment limit to 5 MiB (`maximumImageBytes`);
+  PDF/Word documents retain their 2 MiB limit (`maximumFileBytes`).
+
+- Added `BleFileTransfer`, metadata/state types, in-memory storage and
+  `FileSystemFileTransferStore` for encrypted direct BLE attachments.
+- Added acceptance, progress, retries, cancellation/rejection, integrity
+  receipts and durable restart resume, with bounded quotas.
+- Added an Offline files example screen and failure-oriented protocol tests.
+
+**Upgrade notes:** Additive experimental API. File endpoints both need this
+version; older wire-v3 builds reject the appended file packet type (index 8).
+Existing chat indices/encodings are unchanged. File storage is separate from
+chat storage. No new platform permissions or native channels.
+
 ## 0.1.2
 
 - Added an end-to-end integration guide with per-platform setup, persistent

@@ -135,8 +135,17 @@ void main() {
     announce('c-fresh', 'z');
     await pumpEventQueue(times: 30);
 
-    expect(platform.disconnected, containsAll(['a-stale', 'c-fresh']));
-    expect(platform.disconnected, isNot(contains('b-fresh')));
+    expect(platform.disconnected, isEmpty);
+    platform.sent.clear();
+    await transport.send(
+      packet(
+        type: ChatPacketType.message,
+        sender: 'a',
+        destination: 'p:z',
+        payload: [42],
+      ),
+    );
+    expect(platform.sent.map((frame) => frame.linkId).toSet(), {'b-fresh'});
   });
 
   test(
@@ -163,6 +172,72 @@ void main() {
       await pumpEventQueue(times: 20);
 
       expect(result.deliveredRoutes, 0);
+      expect(platform.disconnected, contains('l1'));
+      expect(currentPeers(), isEmpty);
+    },
+  );
+
+  test(
+    'temporary platform refusal retries the same frame without disconnecting',
+    () async {
+      await startTransport();
+      platform.emitLinkUp('l1');
+      await pumpEventQueue();
+      announce('l1', 'z');
+      await pumpEventQueue(times: 20);
+      final errors = <Object>[];
+      transport.errors.listen(errors.add);
+      final refused = PlatformException(
+        code: 'write_failed',
+        message: 'write was refused by the platform',
+      );
+      platform.sendFailureSequence['l1'] = [refused, refused, null];
+      final result = await transport.send(
+        packet(
+          type: ChatPacketType.message,
+          sender: 'a',
+          destination: 'p:z',
+          payload: [1, 2, 3],
+        ),
+      );
+      expect(result.deliveredRoutes, 1);
+      expect(platform.sendFailureSequence['l1'], isEmpty);
+      expect(platform.disconnected, isNot(contains('l1')));
+      expect(currentPeers(), ['z']);
+      expect(errors, isEmpty);
+    },
+  );
+
+  test(
+    'persistent platform refusal has bounded retries and reconnects',
+    () async {
+      await startTransport();
+      platform.emitLinkUp('l1');
+      await pumpEventQueue();
+      announce('l1', 'z');
+      await pumpEventQueue(times: 20);
+      final refused = PlatformException(
+        code: 'write_failed',
+        message: 'write was refused by the platform',
+      );
+      platform.sendFailureSequence['l1'] = [
+        refused,
+        refused,
+        refused,
+        refused,
+        null,
+      ];
+      final result = await transport.send(
+        packet(
+          type: ChatPacketType.message,
+          sender: 'a',
+          destination: 'p:z',
+          payload: [1, 2, 3],
+        ),
+      );
+      await pumpEventQueue(times: 20);
+      expect(result.deliveredRoutes, 0);
+      expect(platform.sendFailureSequence['l1'], [null]);
       expect(platform.disconnected, contains('l1'));
       expect(currentPeers(), isEmpty);
     },

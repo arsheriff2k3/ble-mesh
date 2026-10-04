@@ -25,6 +25,7 @@ void main() {
     List<String> relays = const [relayOne, relayTwo],
     List<ChatTransport> extra = const [],
     bool start = true,
+    Set<String> publicChannels = const {},
   }) async {
     final keys = await ChatKeyPair.generate();
     final created = _Peer(
@@ -34,6 +35,7 @@ void main() {
       nostr: NostrChatTransport(
         identity: ChatIdentity(peerId: keys.peerId, displayName: name),
         relays: relays,
+        publicChannels: publicChannels,
         connector: network.connect,
         okTimeout: const Duration(seconds: 1),
         minimumReconnectDelay: const Duration(milliseconds: 10),
@@ -52,6 +54,124 @@ void main() {
     a.security.trustStore.observe(b.keys.peerId, b.keys.publicKeys);
     b.security.trustStore.observe(a.keys.peerId, a.keys.publicKeys);
   }
+
+  test(
+    'opted-in public channels reach strangers once over BLE and two relays',
+    () async {
+      final aLocal = TestChatTransport('a');
+      final bLocal = TestChatTransport('b');
+      aLocal.connect(bLocal);
+      addTearDown(aLocal.dispose);
+      addTearDown(bLocal.dispose);
+      final alice = await peer(
+        'alice',
+        publicChannels: {'general'},
+        extra: [aLocal],
+      );
+      final bob = await peer(
+        'bob',
+        publicChannels: {'general'},
+        extra: [bLocal],
+      );
+      final outsider = await peer('outsider');
+      final sent = await alice.chat.send(
+        conversationId: 'general',
+        text: 'hello',
+      );
+      await eventually(
+        () => bob.received.any((message) => message.id == sent.id),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(
+        bob.received.where((message) => message.id == sent.id),
+        hasLength(1),
+      );
+      expect(outsider.received, isEmpty);
+      expect(bob.security.trustStore.keysFor(alice.keys.peerId), isNull);
+      expect(alice.statesOf(sent.id), contains(MessageState.sent));
+      expect(alice.statesOf(sent.id), isNot(contains(MessageState.delivered)));
+      expect(
+        network.relays.values.every((relay) => relay.stored.length == 1),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'public relay-only chat backfills for a receiver that starts later',
+    () async {
+      final alice = await peer('alice', publicChannels: {'general'});
+      final bob = await peer('bob', publicChannels: {'general'}, start: false);
+      await alice.chat.send(
+        conversationId: 'general',
+        text: 'stored public message',
+      );
+      await bob.start();
+      await eventually(() => bob.received.isNotEmpty);
+      expect(bob.received.single.text, 'stored public message');
+    },
+  );
+
+  test(
+    'public messages queued during an outage send when relays return',
+    () async {
+      final alice = await peer('alice', publicChannels: {'general'});
+      final bob = await peer('bob', publicChannels: {'general'});
+      for (final relay in network.relays.values) {
+        relay.goOffline();
+      }
+      await eventually(() => !alice.nostr.available && !bob.nostr.available);
+      final sent = await alice.chat.send(
+        conversationId: 'general',
+        text: 'retry public',
+      );
+      await eventually(
+        () => alice.statesOf(sent.id).contains(MessageState.queued),
+      );
+      for (final relay in network.relays.values) {
+        relay.goOnline();
+      }
+      alice.nostr.reconnectNow();
+      bob.nostr.reconnectNow();
+      await eventually(
+        () => bob.received.any((message) => message.id == sent.id),
+      );
+      expect(
+        bob.received.where((message) => message.id == sent.id),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'public subscription rejects wrong routes and unsigned packets',
+    () async {
+      final alice = await peer('alice', publicChannels: {'general'});
+      final bob = await peer('bob', publicChannels: {'general'});
+      final now = DateTime.now();
+      ChatPacket packet(String destination) => ChatPacket(
+        type: ChatPacketType.message,
+        packetId: createPacketId(),
+        senderId: alice.keys.peerId,
+        destination: destination,
+        ttl: 5,
+        createdAt: now,
+        expiresAt: now.add(const Duration(hours: 1)),
+        payload: Uint8List.fromList(utf8.encode('forged room')),
+      );
+      final wrong = await alice.security.protect(
+        packet('c:other'),
+        encrypt: false,
+      );
+      final route = NostrChatTransport.routeKey('c:general');
+      for (final relay in network.relays.values) {
+        relay.injectEvent(envelope(wrong, route: route).toJson());
+        relay.injectEvent(envelope(packet('c:general')).toJson());
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(bob.received, isEmpty);
+    },
+  );
 
   test('two clients exchange an encrypted direct message online', () async {
     final alice = await peer('alice');
@@ -626,6 +746,7 @@ class _Peer {
     required this.extra,
   }) : chat = BleMeshChat(
          security: security,
+         publicInternetChannels: nostr.publicChannels,
          maximumRelayJitter: Duration.zero,
          minimumRelaySpacing: Duration.zero,
          retryBackoff: const Duration(milliseconds: 100),

@@ -20,7 +20,7 @@ let package = Package(
             dependencies: [
                 .product(name: "FlutterFramework", package: "FlutterFramework")
             ],
-            resources: []
+            resources: [.process("PrivacyInfo.xcprivacy")]
         )
     ]
 )

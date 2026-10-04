@@ -14,6 +14,9 @@ class FakeBlePlatformApi implements BlePlatformApi {
   final List<({String linkId, Uint8List frame})> sent = [];
   final List<String> disconnected = [];
 
+  Duration sendDelay = Duration.zero;
+  int activeSends = 0;
+  int peakSends = 0;
   int startCalls = 0;
   int stopCalls = 0;
   BleConfig? lastConfig;
@@ -24,6 +27,7 @@ class FakeBlePlatformApi implements BlePlatformApi {
 
   /// Per-link send failures, keyed by link id.
   final Map<String, Object> sendFailures = {};
+  final Map<String, List<Object?>> sendFailureSequence = {};
 
   List<BleLink> platformLinks = const [];
 
@@ -52,8 +56,9 @@ class FakeBlePlatformApi implements BlePlatformApi {
     ),
   );
 
-  void emitLinkDown(String linkId, {String? reason}) =>
-      emit(BleEvent(kind: BleEventKind.linkDown, linkId: linkId, message: reason));
+  void emitLinkDown(String linkId, {String? reason}) => emit(
+    BleEvent(kind: BleEventKind.linkDown, linkId: linkId, message: reason),
+  );
 
   void emitFrame(String linkId, List<int> bytes) => emit(
     BleEvent(
@@ -125,9 +130,21 @@ class FakeBlePlatformApi implements BlePlatformApi {
   @override
   Future<void> send(String linkId, Uint8List frame) async {
     _maybeThrow();
+    final sequence = sendFailureSequence[linkId];
+    if (sequence != null && sequence.isNotEmpty) {
+      final next = sequence.removeAt(0);
+      if (next != null) throw next;
+    }
     final failure = sendFailures[linkId];
     if (failure != null) throw failure;
     sent.add((linkId: linkId, frame: frame));
+    activeSends++;
+    if (activeSends > peakSends) peakSends = activeSends;
+    try {
+      if (sendDelay > Duration.zero) await Future<void>.delayed(sendDelay);
+    } finally {
+      activeSends--;
+    }
   }
 
   @override

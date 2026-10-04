@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'ble_mesh_chat'
-  s.version          = '0.1.1'
+  s.version          = '0.1.2'
   s.summary          = 'Dual-role BLE byte transport for offline mesh networks.'
   s.description      = <<-DESC
 Dual-role (central + peripheral) Bluetooth Low Energy byte transport. The native

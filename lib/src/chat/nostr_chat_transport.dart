@@ -41,8 +41,9 @@ class NostrRelayException implements Exception {
 ///
 /// Scope in this release:
 ///
-/// * only direct (`p:`) packets are published: messages, acknowledgements,
-///   and group-key updates. Channel and group traffic stays on BLE;
+/// * direct (`p:`) packets and explicitly opted-in public channel text can
+///   be published. Public channels are signed but unencrypted; with no
+///   [publicChannels] supplied they stay on BLE;
 /// * only packets this device originated are published. Relaying and
 ///   BLE/Nostr bridging are deliberately absent;
 /// * a relay `OK` counts as a delivered *route*. The facade still reports
@@ -60,6 +61,7 @@ class NostrChatTransport implements RelayChatTransport {
   NostrChatTransport({
     required this.identity,
     required List<String> relays,
+    Set<String> publicChannels = const {},
     NostrSocketConnector? connector,
     this.publisherKey,
     this.eventKind = defaultEventKind,
@@ -79,7 +81,8 @@ class NostrChatTransport implements RelayChatTransport {
        _clock = clock ?? DateTime.now,
        _random = random ?? Random.secure(),
        _codec = ChatPacketCodec(maxPacketSize: maximumPacketSize),
-       _relays = _parseRelays(relays, allowInsecure: allowInsecureRelays) {
+       _relays = _parseRelays(relays, allowInsecure: allowInsecureRelays),
+       _publicRoutes = _parsePublicChannels(publicChannels) {
     _ownRouteKey = routeKey('p:${identity.peerId}');
   }
 
@@ -158,6 +161,30 @@ class NostrChatTransport implements RelayChatTransport {
   final ChatPacketCodec _codec;
   final List<_Relay> _relays;
   late final String _ownRouteKey;
+  final Map<String, String> _publicRoutes;
+
+  /// Public, unencrypted channel subscriptions. Empty by default. Channel
+  /// names and relay URLs are supplied by the host application.
+  Set<String> get publicChannels => Set.unmodifiable(
+    _publicRoutes.values.map((destination) => destination.substring(2)),
+  );
+
+  static Map<String, String> _parsePublicChannels(Set<String> channels) {
+    if (channels.length > 32 ||
+        channels.any((name) => name.trim().isEmpty || name.length > 128)) {
+      throw ArgumentError(
+        'public channels must contain at most 32 nonempty names of up to 128 characters',
+      );
+    }
+    return Map.unmodifiable({
+      for (final name in channels) routeKey('c:$name'): 'c:$name',
+    });
+  }
+
+  bool _publicMessage(ChatPacket packet) =>
+      _publicRoutes.values.contains(packet.destination) &&
+      packet.type == ChatPacketType.message &&
+      !packet.isSealed;
 
   /// Whether plain `ws://` relays are accepted, for local test relays only.
   final bool allowInsecureRelays;
@@ -387,7 +414,7 @@ class NostrChatTransport implements RelayChatTransport {
 
   bool _publishable(ChatPacket packet) =>
       packet.senderId == identity.peerId &&
-      packet.destination.startsWith('p:') &&
+      (packet.destination.startsWith('p:') || _publicMessage(packet)) &&
       packet.signature != null &&
       packet.senderKeys != null &&
       !packet.isExpired(_clock());
@@ -533,7 +560,11 @@ class NostrChatTransport implements RelayChatTransport {
           relay.subscriptionId,
           {
             'kinds': [eventKind],
-            '#$routeTag': [_ownRouteKey, ..._bridgedRoutes.keys],
+            '#$routeTag': [
+              _ownRouteKey,
+              ..._bridgedRoutes.keys,
+              ..._publicRoutes.keys,
+            ],
             'since': since,
             'limit': subscriptionLimit,
           },
@@ -715,7 +746,10 @@ class NostrChatTransport implements RelayChatTransport {
     }
     final route = event.tag(routeTag);
     final bridgedPeer = _bridgedRoutes[route];
-    if (route != _ownRouteKey && bridgedPeer == null) {
+    final publicDestination = _publicRoutes[route];
+    if (route != _ownRouteKey &&
+        bridgedPeer == null &&
+        publicDestination == null) {
       throw reject('not addressed to this peer');
     }
     final packetId = event.tag('d');
@@ -745,11 +779,14 @@ class NostrChatTransport implements RelayChatTransport {
       throw reject('undecodable packet: ${error.message}');
     }
     if (packet.id != packetId) throw reject('packet id does not match tag');
-    final expected = bridgedPeer == null
-        ? 'p:${identity.peerId}'
-        : 'p:$bridgedPeer';
+    final expected =
+        publicDestination ??
+        (bridgedPeer == null ? 'p:${identity.peerId}' : 'p:$bridgedPeer');
     if (packet.destination != expected) {
       throw reject('packet destination does not match its route');
+    }
+    if (publicDestination != null && !_publicMessage(packet)) {
+      throw reject('public channels accept only unsealed text messages');
     }
     if (bridgedPeer != null && !packet.bridgeable) {
       throw reject('packet for a bridged peer lacks bridge consent');

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:ble_mesh_chat/ble_mesh_chat.dart';
@@ -6,6 +7,40 @@ import 'package:flutter_test/flutter_test.dart';
 import 'test_chat_transport.dart';
 
 void main() {
+  for (final fail in [false, true]) {
+    test(
+      'queue send finishing after disposal is safe (failure: $fail)',
+      () async {
+        final transport = _PausedChatTransport('a');
+        final peer = TestChatTransport('b');
+        final chat = createChat();
+        await chat.initialize(
+          identity: const ChatIdentity(peerId: 'a', displayName: 'A'),
+          transports: [transport],
+        );
+        await chat.sendDirect(peerId: 'b', text: 'queued before reconnect');
+        transport.pause = true;
+        transport.connect(peer);
+        await transport.started.future;
+        await chat.dispose();
+        if (fail) {
+          transport.result.completeError(StateError('transport stopped'));
+        } else {
+          transport.result.complete(
+            const ChatTransportSendResult(
+              attemptedRoutes: 1,
+              deliveredRoutes: 1,
+            ),
+          );
+        }
+        await pumpEventQueue(times: 20);
+        expect(chat.isInitialized, isFalse);
+        await transport.dispose();
+        await peer.dispose();
+      },
+    );
+  }
+
   test('A and C exchange a direct message through relay B', () async {
     final aTransport = TestChatTransport('a');
     final bTransport = TestChatTransport('b');
@@ -153,3 +188,27 @@ BleMeshChat createChat() => BleMeshChat(
   maximumRelayJitter: Duration.zero,
   minimumRelaySpacing: Duration.zero,
 );
+
+class _PausedChatTransport extends TestChatTransport {
+  _PausedChatTransport(super.nodeId);
+  bool pause = false;
+  final started = Completer<void>();
+  final result = Completer<ChatTransportSendResult>();
+
+  @override
+  Future<ChatTransportSendResult> send(
+    ChatPacket packet, {
+    String? routeId,
+    String? excludeRouteId,
+  }) {
+    if (!pause) {
+      return super.send(
+        packet,
+        routeId: routeId,
+        excludeRouteId: excludeRouteId,
+      );
+    }
+    if (!started.isCompleted) started.complete();
+    return result.future;
+  }
+}

@@ -41,6 +41,9 @@ enum ChatPacketType {
   /// A consenting device asking nearby gateways to receive its online
   /// traffic for a short time. Signed; carries no payload.
   bridgeRegistration,
+
+  /// Encrypted direct file control/data, owned by BleFileTransfer (TTL 1).
+  fileTransfer,
 }
 
 /// A protocol packet shared by every chat transport.

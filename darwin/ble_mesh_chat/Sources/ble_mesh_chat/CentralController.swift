@@ -101,8 +101,9 @@ final class CentralController: NSObject {
     connectTimers.values.forEach { $0.cancel() }
     connectTimers.removeAll()
 
-    for peripheral in retained.values {
+    for peripheral in Array(retained.values) {
       manager?.cancelPeripheralConnection(peripheral)
+      teardown(peripheral, reason: "transport stopped", countAsFailure: false)
     }
     retained.removeAll()
     connecting.removeAll()
@@ -112,7 +113,8 @@ final class CentralController: NSObject {
   }
 
   func write(link: MeshLink, frame: Data, completion: @escaping Completion) {
-    guard let peripheral = link.peripheral, link.characteristic != nil else {
+    guard running, manager?.state == .poweredOn,
+      let peripheral = link.peripheral, link.characteristic != nil else {
       completion(BleTransportError.notReady("link \(link.linkId) has no GATT client"))
       return
     }
@@ -219,7 +221,8 @@ final class CentralController: NSObject {
   /// exactly what `canSendWriteWithoutResponse` gates.
   private func pumpWrites(for peripheral: CBPeripheral) {
     let id = peripheral.identifier
-    guard let link = registry.link(role: .central, remoteId: id.uuidString),
+    guard running, manager?.state == .poweredOn,
+      let link = registry.link(role: .central, remoteId: id.uuidString),
       let characteristic = link.characteristic
     else {
       failQueuedWrites(for: id, reason: "link is gone")
@@ -281,6 +284,8 @@ final class CentralController: NSObject {
       registry.remove(id: link.linkId)
       events.linkDown(link.linkId, reason: reason)
     }
+    connectTimers.values.forEach { $0.cancel() }
+    connectTimers.removeAll()
     retained.removeAll()
     connecting.removeAll()
     failAllQueuedWrites(reason: reason)
@@ -304,9 +309,13 @@ extension CentralController: CBCentralManagerDelegate {
   func centralManagerDidUpdateState(_ central: CBCentralManager) {
     let state = CentralController.map(central.state)
 
-    let waiters = stateWaiters
-    stateWaiters.removeAll()
-    for waiter in waiters { waiter(state) }
+    // Resetting/unknown is not a permission decision. Keep the request pending
+    // until the radio has a definite state or awaitState's timeout expires.
+    if state != .unknown {
+      let waiters = stateWaiters
+      stateWaiters.removeAll()
+      for waiter in waiters { waiter(state) }
+    }
 
     onAdapterStateChange?(state)
 
@@ -314,6 +323,8 @@ extension CentralController: CBCentralManagerDelegate {
     case .poweredOn:
       if running { startScanWindow() }
     default:
+      scanTimer?.cancel()
+      scanTimer = nil
       scanning = false
       dropAllLinks(reason: "bluetooth unavailable (\(state))")
     }
@@ -329,7 +340,10 @@ extension CentralController: CBCentralManagerDelegate {
   }
 
   func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-    guard let serviceUUID else { return }
+    guard running, let serviceUUID else {
+      central.cancelPeripheralConnection(peripheral)
+      return
+    }
     peripheral.delegate = self
     peripheral.discoverServices([serviceUUID])
   }
@@ -354,7 +368,7 @@ extension CentralController: CBCentralManagerDelegate {
     teardown(
       peripheral,
       reason: error?.localizedDescription ?? "peer disconnected",
-      countAsFailure: error != nil
+      countAsFailure: running && error != nil
     )
   }
 
@@ -378,6 +392,7 @@ extension CentralController: CBCentralManagerDelegate {
 
 extension CentralController: CBPeripheralDelegate {
   func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+    guard running else { return }
     guard error == nil, let serviceUUID, let characteristicUUID else {
       teardown(
         peripheral,
@@ -398,6 +413,7 @@ extension CentralController: CBPeripheralDelegate {
     didDiscoverCharacteristicsFor service: CBService,
     error: Error?
   ) {
+    guard running else { return }
     guard error == nil, let characteristicUUID,
       let characteristic = service.characteristics?.first(where: { $0.uuid == characteristicUUID })
     else {
@@ -418,6 +434,7 @@ extension CentralController: CBPeripheralDelegate {
     didUpdateNotificationStateFor characteristic: CBCharacteristic,
     error: Error?
   ) {
+    guard running else { return }
     guard error == nil, characteristic.isNotifying else {
       teardown(
         peripheral,

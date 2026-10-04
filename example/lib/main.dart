@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'file_transfer_page.dart';
+
 void main() => runApp(const MeshChatHarness());
 
 class MeshChatHarness extends StatelessWidget {
@@ -39,6 +41,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   BleChatTransport? _chatTransport;
   NostrChatTransport? _nostr;
   BleMeshChat? _chat;
+  BleFileTransfer? _files;
   File? _relayFile;
   List<String> _relayUrls = const [];
   List<Uri> _connectedRelays = const [];
@@ -137,6 +140,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       transport: ble,
       security: security,
     );
+    final files = BleFileTransfer(
+      transport: chatTransport,
+      security: security,
+      store: FileSystemFileTransferStore(
+        directory: Directory('${directory.path}/files/${keys.peerId}'),
+      ),
+    );
+    await files.start();
+    _subscriptions.add(
+      files.errors.listen((error) => _append('File transfer: $error')),
+    );
     if (!mounted) return;
     setState(() {
       _identity = identity;
@@ -145,6 +159,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       _ble = ble;
       _chat = chat;
       _chatTransport = chatTransport;
+      _files = files;
       _relayFile = relayFile;
       _relayUrls = relayUrls;
       _bridgeFile = bridgeFile;
@@ -884,6 +899,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   }
 
   Future<void> _disposeTransports() async {
+    await _files?.dispose();
     await _chat?.dispose();
     await _ble?.dispose();
   }
@@ -910,6 +926,26 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       appBar: AppBar(
         title: const Text('ble_mesh chat harness'),
         actions: [
+          IconButton(
+            tooltip: 'Offline files',
+            icon: const Icon(Icons.attach_file),
+            onPressed: _files == null
+                ? null
+                : () => Navigator.of(context).push<void>(
+                    MaterialPageRoute(
+                      builder: (_) => FileTransferPage(
+                        service: _files!,
+                        peers: _peers
+                            .where(
+                              (peer) =>
+                                  peer.transportId == 'ble' &&
+                                  peer.canReceiveDirect,
+                            )
+                            .toList(),
+                      ),
+                    ),
+                  ),
+          ),
           IconButton(
             tooltip: 'Contacts',
             onPressed: _contacts,

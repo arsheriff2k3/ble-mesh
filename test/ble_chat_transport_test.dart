@@ -1,7 +1,6 @@
-import 'dart:typed_data';
-
 import 'package:ble_mesh_chat/ble_mesh_chat.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/services.dart';
 
 import 'fake_ble_platform_api.dart';
 
@@ -26,7 +25,50 @@ void main() {
     await platform.close();
   });
 
-  test('announces on link-up and suppresses the duplicate peer link', () async {
+  test(
+    'large negotiated MTUs cannot exceed the 512-byte attribute limit',
+    () async {
+      platform.emitLinkUp('large', maxFrameSize: 514);
+      await pumpEventQueue(times: 20);
+      platform.sent.clear();
+      final result = await transport.send(
+        packet(
+          type: ChatPacketType.message,
+          sender: 'a',
+          destination: '*',
+          payload: List.filled(1800, 42),
+        ),
+      );
+      expect(result.deliveredRoutes, 1);
+      expect(platform.sent.length, greaterThan(3));
+      expect(platform.sent.every((frame) => frame.frame.length <= 512), isTrue);
+    },
+  );
+
+  test(
+    'frame submission keeps a bounded queue and waits for every completion',
+    () async {
+      platform.emitLinkUp('window', maxFrameSize: 512);
+      await pumpEventQueue(times: 20);
+      platform.sent.clear();
+      platform.sendDelay = const Duration(milliseconds: 10);
+      platform.peakSends = 0;
+      final result = await transport.send(
+        packet(
+          type: ChatPacketType.message,
+          sender: 'a',
+          destination: '*',
+          payload: List.filled(6000, 42),
+        ),
+      );
+      expect(result.deliveredRoutes, 1);
+      expect(platform.peakSends, 4);
+      expect(platform.activeSends, 0);
+      expect(platform.sent.length, greaterThan(12));
+    },
+  );
+
+  test('keeps both physical roles but sends once per peer', () async {
     final peers = <List<ChatPeer>>[];
     transport.peers.listen(peers.add);
     platform.emitLinkUp('central', role: BleLinkRole.central);
@@ -52,7 +94,46 @@ void main() {
     emitPacket(platform, 'peripheral', announcement);
     await pumpEventQueue(times: 20);
 
-    expect(platform.disconnected, contains('peripheral'));
+    expect(platform.disconnected, isEmpty);
+    platform.sent.clear();
+    final sent = await transport.send(
+      packet(
+        type: ChatPacketType.message,
+        sender: 'a',
+        destination: '*',
+        payload: [42],
+      ),
+    );
+    expect(sent.deliveredRoutes, 1);
+    expect(platform.sent.map((frame) => frame.linkId).toSet(), {'central'});
+    platform.sent.clear();
+    platform.sendFailures['central'] = PlatformException(code: 'unknown_link');
+    final retry = await transport.send(
+      packet(
+        type: ChatPacketType.message,
+        sender: 'a',
+        destination: '*',
+        payload: [44],
+      ),
+    );
+    expect(retry.attemptedRoutes, 2);
+    expect(retry.deliveredRoutes, 1);
+    expect(platform.sent.map((frame) => frame.linkId).toSet(), {'peripheral'});
+    expect(platform.disconnected, isEmpty);
+    platform.sendFailures.clear();
+    platform.sent.clear();
+    platform.emitLinkDown('central');
+    await pumpEventQueue(times: 20);
+    final fallback = await transport.send(
+      packet(
+        type: ChatPacketType.message,
+        sender: 'a',
+        destination: '*',
+        payload: [43],
+      ),
+    );
+    expect(fallback.deliveredRoutes, 1);
+    expect(platform.sent.map((frame) => frame.linkId).toSet(), {'peripheral'});
     expect(peers.last.single.id, 'z');
     expect(peers.last.single.displayName, 'Zed');
   });

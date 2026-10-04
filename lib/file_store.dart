@@ -5,6 +5,8 @@
 /// transport can run where BLE cannot.
 library;
 
+export 'src/files/filesystem_file_transfer_store.dart' show FileSystemFileTransferStore;
+
 export 'src/chat/crypto/group_store_io.dart'
     show FileGroupStore, PlatformGroupStore;
 export 'src/chat/crypto/identity_store.dart'

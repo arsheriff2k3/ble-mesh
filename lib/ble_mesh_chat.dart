@@ -8,6 +8,14 @@
 /// once instead of once per platform.
 library;
 
+export 'src/files/ble_file_transfer.dart' show BleFileTransfer;
+export 'src/files/file_transfer_store.dart'
+    show
+        FileTransfer,
+        FileTransferState,
+        FileTransferStore,
+        InMemoryFileTransferStore;
+
 export 'src/chat/ble_chat_transport.dart' show BleChatTransport;
 export 'src/chat/ble_mesh_chat.dart' show BleMeshChat;
 export 'src/chat/bridge_policy.dart'

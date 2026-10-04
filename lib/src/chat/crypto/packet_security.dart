@@ -136,7 +136,8 @@ class PacketSecurity {
 
     var opened = packet;
     if ((packet.type == ChatPacketType.message ||
-            packet.type == ChatPacketType.groupKeyUpdate) &&
+            packet.type == ChatPacketType.groupKeyUpdate ||
+            packet.type == ChatPacketType.fileTransfer) &&
         packet.destination.startsWith('p:') &&
         !packet.isSealed) {
       throw const MessageSecurityException('unencrypted direct message');

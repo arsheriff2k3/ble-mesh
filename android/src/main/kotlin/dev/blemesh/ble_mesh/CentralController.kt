@@ -55,6 +55,10 @@ class CentralController(
 
     private val gatts = mutableMapOf<String, BluetoothGatt>()
     private val queues = mutableMapOf<String, GattQueue>()
+    private val burstBytes = mutableMapOf<String, Int>()
+    private val burstStarts = mutableMapOf<String, Long>()
+    private val priorityIdle = mutableMapOf<String, Runnable>()
+    private val fastLinks = mutableSetOf<String>()
     private val connectTimeouts = mutableMapOf<String, Runnable>()
 
     fun start(config: BleConfig) {
@@ -74,6 +78,11 @@ class CentralController(
         connectTimeouts.values.forEach { handler.removeCallbacks(it) }
         connectTimeouts.clear()
 
+        priorityIdle.values.forEach { handler.removeCallbacks(it) }
+        priorityIdle.clear()
+        fastLinks.clear()
+        burstBytes.clear()
+        burstStarts.clear()
         gatts.values.forEach { gatt ->
             runCatching { gatt.disconnect() }
             runCatching { gatt.close() }
@@ -105,6 +114,7 @@ class CentralController(
             )
             return
         }
+        noteTransferTraffic(link.address, frame.size)
         queueFor(link.address).enqueue(
             name = "write",
             start = { issueWrite(gatt, characteristic, frame) },
@@ -255,6 +265,7 @@ class CentralController(
             ) {
                 val address = gatt.device.address
                 handler.post {
+                    if (gatts[gatt.device.address] !== gatt) return@post
                     if (status != BluetoothGatt.GATT_SUCCESS ||
                         newState != BluetoothProfile.STATE_CONNECTED
                     ) {
@@ -276,14 +287,16 @@ class CentralController(
             ) {
                 val address = gatt.device.address
                 handler.post {
+                    if (gatts[gatt.device.address] !== gatt) return@post
                     val usable =
                         if (status == BluetoothGatt.GATT_SUCCESS) {
-                            (mtu - ATT_HEADER_BYTES).toLong()
+                            (mtu - ATT_HEADER_BYTES).coerceIn(20, 512).toLong()
                         } else {
                             MeshLink.DEFAULT_MAX_FRAME_SIZE
                         }
                     pendingFrameSize[address] = usable
-                    queueFor(address).complete()
+                    registry.find(BleLinkRole.CENTRAL, address)?.maxFrameSize = usable
+                    queueFor(address).complete(expectedName = "requestMtu")
                 }
             }
 
@@ -292,12 +305,14 @@ class CentralController(
                 status: Int
             ) {
                 handler.post {
+                    if (gatts[gatt.device.address] !== gatt) return@post
                     queueFor(gatt.device.address).complete(
                         if (status == BluetoothGatt.GATT_SUCCESS) {
                             null
                         } else {
                             GattOperationException("service discovery failed with $status")
-                        }
+                        },
+                        expectedName = "discoverServices"
                     )
                 }
             }
@@ -308,12 +323,14 @@ class CentralController(
                 status: Int
             ) {
                 handler.post {
+                    if (gatts[gatt.device.address] !== gatt) return@post
                     queueFor(gatt.device.address).complete(
                         if (status == BluetoothGatt.GATT_SUCCESS) {
                             null
                         } else {
                             GattOperationException("descriptor write failed with $status")
-                        }
+                        },
+                        expectedName = "writeCccd"
                     )
                 }
             }
@@ -324,12 +341,14 @@ class CentralController(
                 status: Int
             ) {
                 handler.post {
+                    if (gatts[gatt.device.address] !== gatt) return@post
                     queueFor(gatt.device.address).complete(
                         if (status == BluetoothGatt.GATT_SUCCESS) {
                             null
                         } else {
                             GattOperationException("write failed with $status")
-                        }
+                        },
+                        expectedName = "write"
                     )
                 }
             }
@@ -361,10 +380,42 @@ class CentralController(
                 status: Int
             ) {
                 handler.post {
+                    if (gatts[gatt.device.address] !== gatt) return@post
                     registry.find(BleLinkRole.CENTRAL, gatt.device.address)?.rssi = rssi.toLong()
                 }
             }
         }
+
+    // Detect sustained traffic in either direction without app-specific packet
+    // parsing. Bulk transfers prefer a short connection interval; idle chat
+    // returns to balanced power automatically. Unsupported requests are benign.
+    private fun noteTransferTraffic(address: String, bytes: Int) {
+        val gatt = gatts[address] ?: return
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - (burstStarts[address] ?: 0L) > 1_000L) {
+            burstStarts[address] = now
+            burstBytes[address] = 0
+        }
+        burstBytes[address] = (burstBytes[address] ?: 0) + bytes
+        if (address !in fastLinks && (burstBytes[address] ?: 0) < 4_096) return
+        if (address !in fastLinks) {
+            if (runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) }.getOrDefault(false)) {
+                fastLinks.add(address)
+            } else return
+        }
+        priorityIdle.remove(address)?.let { handler.removeCallbacks(it) }
+        val idle = Runnable {
+            priorityIdle.remove(address)
+            fastLinks.remove(address)
+            burstBytes.remove(address)
+            burstStarts.remove(address)
+            if (gatts[address] === gatt) {
+                runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED) }
+            }
+        }
+        priorityIdle[address] = idle
+        handler.postDelayed(idle, 2_000L)
+    }
 
     private val pendingFrameSize = mutableMapOf<String, Long>()
 
@@ -374,6 +425,7 @@ class CentralController(
     ) {
         handler.post {
             val link = registry.find(BleLinkRole.CENTRAL, address) ?: return@post
+            noteTransferTraffic(address, value.size)
             events.frame(link.linkId, value)
         }
     }
@@ -442,6 +494,10 @@ class CentralController(
         characteristic: BluetoothGattCharacteristic
     ) {
         val address = gatt.device.address
+        priorityIdle.remove(address)?.let { handler.removeCallbacks(it) }
+        fastLinks.remove(address)
+        burstBytes.remove(address)
+        burstStarts.remove(address)
         connecting.remove(address)
         connectTimeouts.remove(address)?.let { handler.removeCallbacks(it) }
         failures.remove(address)
@@ -469,6 +525,10 @@ class CentralController(
         reason: String?,
         countAsFailure: Boolean
     ) {
+        priorityIdle.remove(address)?.let { handler.removeCallbacks(it) }
+        fastLinks.remove(address)
+        burstBytes.remove(address)
+        burstStarts.remove(address)
         connecting.remove(address)
         connectTimeouts.remove(address)?.let { handler.removeCallbacks(it) }
         pendingFrameSize.remove(address)

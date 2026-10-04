@@ -194,7 +194,7 @@ class PeripheralController(
                 mtu: Int
             ) {
                 handler.post {
-                    val usable = (mtu - ATT_HEADER_BYTES).toLong()
+                    val usable = (mtu - ATT_HEADER_BYTES).coerceIn(20, 512).toLong()
                     pendingFrameSize[device.address] = usable
                     registry.find(BleLinkRole.PERIPHERAL, device.address)?.maxFrameSize = usable
                 }
